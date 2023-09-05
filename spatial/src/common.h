@@ -18,6 +18,7 @@
 #define src_common_h
 
 #include "../include/spatial/common.h"
+#include "../include/spatial/spatial.h"
 
 #include <string.h>
 #include <stdlib.h>

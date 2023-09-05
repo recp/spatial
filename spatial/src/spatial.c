@@ -15,4 +15,9 @@
  */
 
 #include "common.h"
-#include "../include/spatial/spatial.h"
+
+SPTL_EXPORT
+void
+sptl_update(sptl_space_t * __restrict space) {
+  
+}
