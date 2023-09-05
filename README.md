@@ -1,5 +1,6 @@
 # 🔭 spatial - Spatial Space Kernel
 
-This is library, framework that aims to reduce spatial computing in engines. This itself is not render or game engine.
+Spatial aims to optimize spatial computing and provide standardized interfaces for engines. 
+It's not a rendering or game engine; instead, it serves as a kernel to enhance their performance and accelerate development.
 
-README will be updated over time...
+This README will receive updates periodically.
