@@ -39,4 +39,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Dependency: https://github.com/recp/cglm */
+#include <cglm/cglm.h>
+
 #endif /* sptl_common_h */

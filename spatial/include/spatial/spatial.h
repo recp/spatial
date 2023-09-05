@@ -18,16 +18,7 @@
 #define spatial_h
 
 #include "common.h"
-
-/* Dependency: https://github.com/recp/cglm */
-#include <cglm/cglm.h>
-
-typedef struct sptl_transform_t {
-  struct sptl_transform_t *parent;
-  struct sptl_transform_t *chld;
-  struct sptl_transform_t *next;
-  mat4                     mat;
-} sptl_transform_t;
+#include "transform.h"
 
 typedef struct sptl_space_t {
   sptl_transform_t roottrans;
@@ -37,7 +28,7 @@ typedef struct sptl_space_t {
 SPTL_INLINE
 void
 sptl_invalidate(sptl_space_t * __restrict space) {
-  scape->needsupdate = true;
+  space->needsupdate = true;
 }
 
 SPTL_EXPORT
