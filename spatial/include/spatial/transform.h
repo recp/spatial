@@ -93,6 +93,7 @@ typedef struct sptl_skew_t {
 typedef struct sptl_transform_t {
   struct sptl_transform_t *parent;
   struct sptl_transform_t *chld;
+  struct sptl_transform_t *next;
   void                    *obj;
   sptl_transform_item_t   *item;   /* individual transforms             */
   mat4                     local;  /* cached local transform as matrix  */
