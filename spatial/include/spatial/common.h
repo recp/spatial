@@ -14,25 +14,25 @@
  * limitations under the License.
  */
 
-#ifndef sptl_common_h
-#define sptl_common_h
+#ifndef spatial_common_h
+#define spatial_common_h
 
 #if defined(_MSC_VER)
-#  ifdef SPTL_STATIC
-#    define SPTL_EXPORT
-#  elif defined(SPTL_EXPORTS)
-#    define SPTL_EXPORT __declspec(dllexport)
+#  ifdef SPATIAL_STATIC
+#    define SPATIAL_EXPORT
+#  elif defined(SPATIAL_EXPORTS)
+#    define SPATIAL_EXPORT __declspec(dllexport)
 #  else
-#    define SPTL_EXPORT __declspec(dllimport)
+#    define SPATIAL_EXPORT __declspec(dllimport)
 #  endif
-#  define SPTL_HIDE
-#  define SPTL_INLINE __forceinline
-#  define SPTL_ALIGN(X) __declspec(align(X))
+#  define SPATIAL_HIDE
+#  define SPATIAL_INLINE __forceinline
+#  define SPATIAL_ALIGN(X) __declspec(align(X))
 #else
-#  define SPTL_EXPORT  __attribute__((visibility("default")))
-#  define SPTL_HIDE    __attribute__((visibility("hidden")))
-#  define SPTL_INLINE inline __attribute((always_inline))
-#  define SPTL_ALIGN(X) __attribute((aligned(X)))
+#  define SPATIAL_EXPORT  __attribute__((visibility("default")))
+#  define SPATIAL_HIDE    __attribute__((visibility("hidden")))
+#  define SPATIAL_INLINE inline __attribute((always_inline))
+#  define SPATIAL_ALIGN(X) __attribute((aligned(X)))
 #endif
 
 #include <stdlib.h>
@@ -42,4 +42,4 @@
 /* Dependency: https://github.com/recp/cglm */
 #include <cglm/cglm.h>
 
-#endif /* sptl_common_h */
+#endif /* spatial_common_h */

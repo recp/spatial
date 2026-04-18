@@ -1,5 +1,4 @@
-module filt {
-    header "spatial/spatial.h"
-    
-    export *
+module spatial {
+  header "spatial/spatial.h"
+  export *
 }
