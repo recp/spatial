@@ -10,11 +10,17 @@
 
 #include "common.h"
 
-#define SPATIAL_INITIAL_DIRTY_CAPACITY 16
+/* ============================================================== */
+/* Static asserts.                                                  */
+/* ============================================================== */
 
-/* --------------------------------------------------------------- */
-/* Pose conversions and composition.                                */
-/* --------------------------------------------------------------- */
+_Static_assert(sizeof(spatial_node_t)      == 8,  "node handle must be 8 bytes");
+_Static_assert(sizeof(spatial_rot2_t)      == 8,  "rot2 must be 8 bytes");
+_Static_assert(sizeof(spatial_transform2_t) == 16, "transform2 must be 16 bytes");
+
+/* ============================================================== */
+/* Pose math. SIMD comes from cglm primitives.                      */
+/* ============================================================== */
 
 SPATIAL_EXPORT
 void
@@ -72,15 +78,81 @@ spatial_mat4_to_pose(const mat4 m, spatial_pose_t * __restrict out) {
 SPATIAL_EXPORT
 void
 spatial_transform_compose(const spatial_transform_t * __restrict a,
-                       const spatial_transform_t * __restrict b,
-                       spatial_transform_t       * __restrict out) {
+                          const spatial_transform_t * __restrict b,
+                          spatial_transform_t       * __restrict out) {
   vec3 rotated;
   glm_quat_rotatev((float *)a->rotation, (float *)b->position, rotated);
   glm_vec3_add((float *)a->position, rotated, out->position);
   glm_quat_mul((float *)a->rotation, (float *)b->rotation, out->rotation);
 }
 
-/* 2D math. */
+SPATIAL_EXPORT
+void
+spatial_pose_compose(const spatial_pose_t * __restrict a,
+                     const spatial_pose_t * __restrict b,
+                     spatial_pose_t       * __restrict out) {
+  vec3   scaled, rotated, pos, scl;
+  versor rot;
+
+  glm_vec3_mul((float *)a->scale, (float *)b->position, scaled);
+  glm_quat_rotatev((float *)a->rotation, scaled, rotated);
+  glm_vec3_add((float *)a->position, rotated, pos);
+
+  glm_quat_mul((float *)a->rotation, (float *)b->rotation, rot);
+  glm_vec3_mul((float *)a->scale, (float *)b->scale, scl);
+
+  glm_vec3_copy(pos, out->position);
+  glm_quat_copy(rot, out->rotation);
+  glm_vec3_copy(scl, out->scale);
+}
+
+/* Inline hot-path variant operating on raw SoA slots. */
+static SPATIAL_INLINE
+void
+spatial__compose_slots(const vec3 pa, const versor qa, const vec3 sa,
+                       const vec3 pb, const versor qb, const vec3 sb,
+                       vec3 po,       versor qo,       vec3 so) {
+  vec3 scaled, rotated;
+  glm_vec3_mul((float *)sa, (float *)pb, scaled);
+  glm_quat_rotatev((float *)qa, scaled, rotated);
+  glm_vec3_add((float *)pa, rotated, po);
+  glm_quat_mul((float *)qa, (float *)qb, qo);
+  glm_vec3_mul((float *)sa, (float *)sb, so);
+}
+
+/* Inline hot-path pose_to_mat4 operating on raw SoA slots. */
+static SPATIAL_INLINE
+void
+spatial__pose_slots_to_mat4(const vec3 p, const versor q, const vec3 s, mat4 out) {
+  glm_quat_mat4((float *)q, out);
+  out[0][0] *= s[0]; out[0][1] *= s[0]; out[0][2] *= s[0];
+  out[1][0] *= s[1]; out[1][1] *= s[1]; out[1][2] *= s[1];
+  out[2][0] *= s[2]; out[2][1] *= s[2]; out[2][2] *= s[2];
+  out[3][0] = p[0]; out[3][1] = p[1]; out[3][2] = p[2];
+  out[3][3] = 1.0f;
+}
+
+/* SIMD-friendly pose diff using cglm vector ops. */
+static SPATIAL_INLINE
+bool
+spatial__pose_slots_differ(const vec3 pa, const versor qa, const vec3 sa,
+                           const vec3 pb, const versor qb, const vec3 sb) {
+  const float eps2 = 1e-12f;
+  vec3   dp, ds;
+  versor dq;
+
+  glm_vec3_sub((float *)pa, (float *)pb, dp);
+  glm_vec3_sub((float *)sa, (float *)sb, ds);
+  glm_vec4_sub((float *)qa, (float *)qb, dq);
+
+  return glm_vec3_norm2(dp) > eps2
+      || glm_vec3_norm2(ds) > eps2
+      || glm_vec4_norm2(dq) > eps2;
+}
+
+/* ============================================================== */
+/* 2D math.                                                         */
+/* ============================================================== */
 
 SPATIAL_EXPORT
 void
@@ -102,13 +174,12 @@ void
 spatial_pose2_compose(const spatial_pose2_t * __restrict a,
                       const spatial_pose2_t * __restrict b,
                       spatial_pose2_t       * __restrict out) {
-  vec2 scaled, rotated;
+  vec2           scaled, rotated;
   spatial_rot2_t rot;
 
   scaled[0] = a->scale[0] * b->position[0];
   scaled[1] = a->scale[1] * b->position[1];
   spatial_rot2_rotatev(a->rotation, scaled, rotated);
-
   spatial_rot2_mul(a->rotation, b->rotation, &rot);
 
   out->position[0] = a->position[0] + rotated[0];
@@ -132,34 +203,56 @@ spatial_pose2_to_mat3(const spatial_pose2_t * __restrict p, mat3 out) {
   out[2][2] =  1.0f;
 }
 
-SPATIAL_EXPORT
+/* ============================================================== */
+/* Internal helpers: SoA storage management.                        */
+/* ============================================================== */
+
+#define SPATIAL_INITIAL_DIRTY_CAPACITY 16
+#define SPATIAL_INITIAL_TRAV_CAPACITY  64
+
+/* Iterative traversal stack entry. */
+typedef struct spatial__trav_t {
+  spatial_node_t node;
+  uint32_t       parent_changed;
+} spatial__trav_t;
+
+static
 void
-spatial_pose_compose(const spatial_pose_t * __restrict a,
-                  const spatial_pose_t * __restrict b,
-                  spatial_pose_t       * __restrict out) {
-  vec3 scaled, rotated;
-  versor rot;
-  vec3 pos, scl;
+spatial__grow_arrays(spatial_space_t *space, uint32_t new_cap) {
+  uint32_t old_cap = space->capacity;
 
-  /* position = a.pos + a.rot * (a.scale * b.pos) */
-  glm_vec3_mul((float *)a->scale, (float *)b->position, scaled);
-  glm_quat_rotatev((float *)a->rotation, scaled, rotated);
-  glm_vec3_add((float *)a->position, rotated, pos);
+  space->generations     = realloc(space->generations,     sizeof(uint32_t)       * new_cap);
+  space->parents         = realloc(space->parents,         sizeof(spatial_node_t) * new_cap);
+  space->first_children  = realloc(space->first_children,  sizeof(spatial_node_t) * new_cap);
+  space->next_siblings   = realloc(space->next_siblings,   sizeof(spatial_node_t) * new_cap);
+  space->local_positions = realloc(space->local_positions, sizeof(vec3)           * new_cap);
+  space->local_rotations = realloc(space->local_rotations, sizeof(versor)         * new_cap);
+  space->local_scales    = realloc(space->local_scales,    sizeof(vec3)           * new_cap);
+  space->world_positions = realloc(space->world_positions, sizeof(vec3)           * new_cap);
+  space->world_rotations = realloc(space->world_rotations, sizeof(versor)         * new_cap);
+  space->world_scales    = realloc(space->world_scales,    sizeof(vec3)           * new_cap);
+  space->world_matrices  = realloc(space->world_matrices,  sizeof(mat4)           * new_cap);
+  space->flags           = realloc(space->flags,           sizeof(uint32_t)       * new_cap);
+  space->versions        = realloc(space->versions,        sizeof(uint32_t)       * new_cap);
+  space->users           = realloc(space->users,           sizeof(void *)         * new_cap);
+  space->matrix_overrides= realloc(space->matrix_overrides,
+                                   sizeof(spatial_matrix_override_t *) * new_cap);
 
-  /* rotation = a.rot * b.rot */
-  glm_quat_mul((float *)a->rotation, (float *)b->rotation, rot);
+  if (new_cap > old_cap) {
+    uint32_t delta = new_cap - old_cap;
+    memset(space->generations      + old_cap, 0, sizeof(uint32_t)       * delta);
+    memset(space->parents          + old_cap, 0, sizeof(spatial_node_t) * delta);
+    memset(space->first_children   + old_cap, 0, sizeof(spatial_node_t) * delta);
+    memset(space->next_siblings    + old_cap, 0, sizeof(spatial_node_t) * delta);
+    memset(space->flags            + old_cap, 0, sizeof(uint32_t)       * delta);
+    memset(space->versions         + old_cap, 0, sizeof(uint32_t)       * delta);
+    memset(space->users            + old_cap, 0, sizeof(void *)         * delta);
+    memset(space->matrix_overrides + old_cap, 0,
+           sizeof(spatial_matrix_override_t *) * delta);
+  }
 
-  /* scale = a.scale * b.scale */
-  glm_vec3_mul((float *)a->scale, (float *)b->scale, scl);
-
-  glm_vec3_copy(pos, out->position);
-  glm_quat_copy(rot, out->rotation);
-  glm_vec3_copy(scl, out->scale);
+  space->capacity = new_cap;
 }
-
-/* --------------------------------------------------------------- */
-/* Space and node storage.                                          */
-/* --------------------------------------------------------------- */
 
 static
 uint32_t
@@ -168,138 +261,175 @@ spatial__alloc_slot(spatial_space_t * __restrict space) {
 
   if (space->free_head != 0) {
     slot = space->free_head;
-    /* free list is threaded through parent.index of freed nodes */
-    space->free_head = space->nodes[slot].parent.index;
+    space->free_head = space->parents[slot].index;
   } else {
-    if (space->count >= space->capacity) {
-      uint32_t new_cap = space->capacity * 2;
-      space->nodes       = realloc(space->nodes,
-                                   sizeof(spatial_node_data_t) * new_cap);
-      space->generations = realloc(space->generations,
-                                   sizeof(uint32_t) * new_cap);
-      memset(space->nodes + space->capacity, 0,
-             sizeof(spatial_node_data_t) * (new_cap - space->capacity));
-      memset(space->generations + space->capacity, 0,
-             sizeof(uint32_t) * (new_cap - space->capacity));
-      space->capacity = new_cap;
+    if (SPATIAL_UNLIKELY(space->count >= space->capacity)) {
+      spatial__grow_arrays(space, space->capacity * 2);
     }
     slot = space->count++;
   }
-
   return slot;
+}
+
+/* Dirty push with ancestor dedupe: skip if any ancestor is already dirty. */
+static
+void
+spatial__push_dirty(spatial_space_t * __restrict space, spatial_node_t handle) {
+  spatial_node_t a;
+  const uint32_t dirty_mask = SPATIAL_NODE_DIRTY_LOCAL | SPATIAL_NODE_DIRTY_WORLD;
+
+  a = space->parents[handle.index];
+  while (!spatial_node_is_null(a)) {
+    if (SPATIAL_UNLIKELY(a.index >= space->capacity)) break;
+    if (space->flags[a.index] & dirty_mask) {
+      return;  /* ancestor will cover us */
+    }
+    a = space->parents[a.index];
+  }
+
+  if (SPATIAL_UNLIKELY(space->dirty_count >= space->dirty_capacity)) {
+    uint32_t nc = space->dirty_capacity * 2;
+    space->dirty_roots    = realloc(space->dirty_roots, sizeof(spatial_node_t) * nc);
+    space->dirty_capacity = nc;
+  }
+  space->dirty_roots[space->dirty_count++] = handle;
 }
 
 static
 void
-spatial__push_dirty(spatial_space_t * __restrict space, spatial_node_t node) {
-  if (space->dirty_count >= space->dirty_capacity) {
-    uint32_t new_cap = space->dirty_capacity * 2;
-    space->dirty_roots    = realloc(space->dirty_roots,
-                                    sizeof(spatial_node_t) * new_cap);
-    space->dirty_capacity = new_cap;
+spatial__ensure_trav_capacity(spatial_space_t *space, uint32_t want) {
+  if (space->trav_capacity < want) {
+    uint32_t nc = space->trav_capacity ? space->trav_capacity : SPATIAL_INITIAL_TRAV_CAPACITY;
+    while (nc < want) nc *= 2;
+    space->trav_stack    = realloc(space->trav_stack, sizeof(spatial__trav_t) * nc);
+    space->trav_capacity = nc;
   }
-  space->dirty_roots[space->dirty_count++] = node;
 }
+
+/* ============================================================== */
+/* Space + node lifecycle.                                          */
+/* ============================================================== */
 
 SPATIAL_EXPORT
 spatial_space_t *
 spatial_space_create(uint32_t initial_capacity) {
   spatial_space_t *space;
+  uint32_t         slot;
 
   if (initial_capacity < 2) initial_capacity = 16;
 
   space = calloc(1, sizeof(spatial_space_t));
-  space->nodes       = calloc(initial_capacity, sizeof(spatial_node_data_t));
-  space->generations = calloc(initial_capacity, sizeof(uint32_t));
-  space->capacity    = initial_capacity;
-  space->count       = 1;  /* reserve slot 0 for SPATIAL_NODE_NULL */
-  space->free_head   = 0;
+  space->count     = 1;  /* reserve slot 0 for null */
+  space->free_head = 0;
+  spatial__grow_arrays(space, initial_capacity);
 
-  space->dirty_roots    = calloc(SPATIAL_INITIAL_DIRTY_CAPACITY,
-                                 sizeof(spatial_node_t));
+  space->dirty_roots    = calloc(SPATIAL_INITIAL_DIRTY_CAPACITY, sizeof(spatial_node_t));
   space->dirty_capacity = SPATIAL_INITIAL_DIRTY_CAPACITY;
 
-  /* create the root node at slot 1 */
-  {
-    uint32_t slot = spatial__alloc_slot(space);
-    spatial_node_data_t *n = &space->nodes[slot];
-
-    n->parent       = SPATIAL_NODE_NULL;
-    n->first_child  = SPATIAL_NODE_NULL;
-    n->next_sibling = SPATIAL_NODE_NULL;
-    n->local        = SPATIAL_POSE_IDENTITY;
-    n->world        = SPATIAL_POSE_IDENTITY;
-    glm_mat4_identity(n->world_matrix);
-    n->flags        = SPATIAL_NODE_ALIVE;
-    n->version      = 1;
-
-    space->generations[slot] = 1;
-    space->root = (spatial_node_t){ .index = slot, .generation = 1 };
-  }
+  /* root at slot 1 */
+  slot = spatial__alloc_slot(space);
+  space->parents[slot]         = SPATIAL_NODE_NULL;
+  space->first_children[slot]  = SPATIAL_NODE_NULL;
+  space->next_siblings[slot]   = SPATIAL_NODE_NULL;
+  glm_vec3_zero(space->local_positions[slot]);
+  glm_quat_identity(space->local_rotations[slot]);
+  glm_vec3_one(space->local_scales[slot]);
+  glm_vec3_zero(space->world_positions[slot]);
+  glm_quat_identity(space->world_rotations[slot]);
+  glm_vec3_one(space->world_scales[slot]);
+  glm_mat4_identity(space->world_matrices[slot]);
+  space->flags[slot]    = SPATIAL_NODE_ALIVE;
+  space->versions[slot] = 1;
+  space->users[slot]    = NULL;
+  space->matrix_overrides[slot] = NULL;
+  space->generations[slot]      = 1;
+  space->root = (spatial_node_t){ .index = slot, .generation = 1 };
 
   return space;
 }
 
 SPATIAL_EXPORT
 void
-spatial_space_destroy(spatial_space_t * __restrict space) {
+spatial_space_destroy(spatial_space_t *space) {
+  uint32_t i;
+
   if (!space) return;
-  free(space->nodes);
+
+  for (i = 1; i < space->count; i++) {
+    if (space->matrix_overrides[i]) free(space->matrix_overrides[i]);
+  }
+
   free(space->generations);
+  free(space->parents);
+  free(space->first_children);
+  free(space->next_siblings);
+  free(space->local_positions);
+  free(space->local_rotations);
+  free(space->local_scales);
+  free(space->world_positions);
+  free(space->world_rotations);
+  free(space->world_scales);
+  free(space->world_matrices);
+  free(space->flags);
+  free(space->versions);
+  free(space->users);
+  free(space->matrix_overrides);
   free(space->dirty_roots);
+  free(space->trav_stack);
   free(space);
 }
 
 SPATIAL_EXPORT
 bool
 spatial_node_valid(const spatial_space_t * __restrict space, spatial_node_t handle) {
-  if (handle.index == 0 || handle.index >= space->capacity) return false;
-  if (space->generations[handle.index] != handle.generation) return false;
-  return (space->nodes[handle.index].flags & SPATIAL_NODE_ALIVE) != 0;
-}
-
-SPATIAL_EXPORT
-spatial_node_data_t *
-spatial_node_get(spatial_space_t * __restrict space, spatial_node_t handle) {
-  if (!spatial_node_valid(space, handle)) return NULL;
-  return &space->nodes[handle.index];
+  if (SPATIAL_UNLIKELY(handle.index == 0 || handle.index >= space->capacity)) return false;
+  if (SPATIAL_UNLIKELY(space->generations[handle.index] != handle.generation)) return false;
+  return (space->flags[handle.index] & SPATIAL_NODE_ALIVE) != 0;
 }
 
 SPATIAL_EXPORT
 spatial_node_t
 spatial_node_create(spatial_space_t      * __restrict space,
-                 spatial_node_t                    parent,
-                 const spatial_pose_t * __restrict local) {
-  uint32_t          slot;
-  spatial_node_data_t *n;
-  spatial_node_t       handle;
+                    spatial_node_t                    parent,
+                    const spatial_pose_t * __restrict local) {
+  uint32_t       slot;
+  spatial_node_t handle;
 
   if (spatial_node_is_null(parent)) parent = space->root;
-  if (!spatial_node_valid(space, parent)) return SPATIAL_NODE_NULL;
+  if (SPATIAL_UNLIKELY(!spatial_node_valid(space, parent))) return SPATIAL_NODE_NULL;
 
   slot = spatial__alloc_slot(space);
-  n    = &space->nodes[slot];
 
-  n->parent       = parent;
-  n->first_child  = SPATIAL_NODE_NULL;
-  n->next_sibling = SPATIAL_NODE_NULL;
-  n->local        = local ? *local : SPATIAL_POSE_IDENTITY;
-  n->world        = SPATIAL_POSE_IDENTITY;
-  glm_mat4_identity(n->world_matrix);
-  n->flags        = SPATIAL_NODE_ALIVE | SPATIAL_NODE_DIRTY_LOCAL;
-  n->version      = 1;
-  n->user         = NULL;
+  space->parents[slot]        = parent;
+  space->first_children[slot] = SPATIAL_NODE_NULL;
+  /* link under parent */
+  space->next_siblings[slot]       = space->first_children[parent.index];
+  space->first_children[parent.index] = (spatial_node_t){ .index = slot, .generation = 0 }; /* fix gen below */
+
+  if (local) {
+    glm_vec3_copy((float *)local->position, space->local_positions[slot]);
+    glm_quat_copy((float *)local->rotation, space->local_rotations[slot]);
+    glm_vec3_copy((float *)local->scale,    space->local_scales[slot]);
+  } else {
+    glm_vec3_zero(space->local_positions[slot]);
+    glm_quat_identity(space->local_rotations[slot]);
+    glm_vec3_one(space->local_scales[slot]);
+  }
+  glm_vec3_zero(space->world_positions[slot]);
+  glm_quat_identity(space->world_rotations[slot]);
+  glm_vec3_one(space->world_scales[slot]);
+  glm_mat4_identity(space->world_matrices[slot]);
+  space->flags[slot]            = SPATIAL_NODE_ALIVE | SPATIAL_NODE_DIRTY_LOCAL;
+  space->versions[slot]         = 1;
+  space->users[slot]            = NULL;
+  space->matrix_overrides[slot] = NULL;
 
   space->generations[slot]++;
-  if (space->generations[slot] == 0) space->generations[slot] = 1;
+  if (SPATIAL_UNLIKELY(space->generations[slot] == 0)) space->generations[slot] = 1;
   handle = (spatial_node_t){ .index = slot, .generation = space->generations[slot] };
 
-  /* link under parent */
-  {
-    spatial_node_data_t *p = &space->nodes[parent.index];
-    n->next_sibling = p->first_child;
-    p->first_child  = handle;
-  }
+  /* patch sibling link we stored above with correct generation */
+  space->first_children[parent.index] = handle;
 
   spatial__push_dirty(space, handle);
   return handle;
@@ -307,64 +437,58 @@ spatial_node_create(spatial_space_t      * __restrict space,
 
 static
 void
-spatial__unlink_from_parent(spatial_space_t * __restrict space, spatial_node_t handle) {
-  spatial_node_data_t *n, *p;
-  spatial_node_t       cur;
+spatial__unlink_from_parent(spatial_space_t *space, spatial_node_t handle) {
+  spatial_node_t parent, cur;
 
-  n = &space->nodes[handle.index];
-  if (spatial_node_is_null(n->parent)) return;
+  parent = space->parents[handle.index];
+  if (spatial_node_is_null(parent)) return;
 
-  p = &space->nodes[n->parent.index];
-  if (spatial_node_eq(p->first_child, handle)) {
-    p->first_child = n->next_sibling;
+  if (spatial_node_eq(space->first_children[parent.index], handle)) {
+    space->first_children[parent.index] = space->next_siblings[handle.index];
   } else {
-    cur = p->first_child;
+    cur = space->first_children[parent.index];
     while (!spatial_node_is_null(cur)) {
-      spatial_node_data_t *cd = &space->nodes[cur.index];
-      if (spatial_node_eq(cd->next_sibling, handle)) {
-        cd->next_sibling = n->next_sibling;
+      if (spatial_node_eq(space->next_siblings[cur.index], handle)) {
+        space->next_siblings[cur.index] = space->next_siblings[handle.index];
         break;
       }
-      cur = cd->next_sibling;
+      cur = space->next_siblings[cur.index];
     }
   }
-  n->next_sibling = SPATIAL_NODE_NULL;
+  space->next_siblings[handle.index] = SPATIAL_NODE_NULL;
 }
 
 SPATIAL_EXPORT
 void
 spatial_node_destroy(spatial_space_t * __restrict space, spatial_node_t handle) {
-  spatial_node_data_t *n;
-  spatial_node_t       child;
+  spatial_node_t child;
 
   if (!spatial_node_valid(space, handle)) return;
-  if (spatial_node_eq(handle, space->root)) return;  /* root is permanent */
+  if (spatial_node_eq(handle, space->root)) return;
 
-  n = &space->nodes[handle.index];
-
-  /* destroy children first (depth-first) */
-  child = n->first_child;
+  /* destroy children first (depth-first, iterative not strictly needed here) */
+  child = space->first_children[handle.index];
   while (!spatial_node_is_null(child)) {
-    spatial_node_t next = space->nodes[child.index].next_sibling;
+    spatial_node_t next = space->next_siblings[child.index];
     spatial_node_destroy(space, child);
     child = next;
   }
 
   spatial__unlink_from_parent(space, handle);
 
-  if (n->matrix_override) {
-    free(n->matrix_override);
-    n->matrix_override = NULL;
+  if (space->matrix_overrides[handle.index]) {
+    free(space->matrix_overrides[handle.index]);
+    space->matrix_overrides[handle.index] = NULL;
   }
 
-  n->flags = 0;  /* clear ALIVE */
-  n->parent.index = space->free_head;  /* thread free list */
+  space->flags[handle.index] = 0;
+  /* thread free-list through parent.index */
+  space->parents[handle.index] = (spatial_node_t){ .index = space->free_head, .generation = 0 };
   space->free_head = handle.index;
   space->generations[handle.index]++;
-  if (space->generations[handle.index] == 0) space->generations[handle.index] = 1;
+  if (SPATIAL_UNLIKELY(space->generations[handle.index] == 0)) space->generations[handle.index] = 1;
 }
 
-/* returns true iff candidate descends from root (including root itself). */
 static
 bool
 spatial__is_descendant(const spatial_space_t *space,
@@ -374,7 +498,7 @@ spatial__is_descendant(const spatial_space_t *space,
   while (!spatial_node_is_null(cur)) {
     if (spatial_node_eq(cur, root)) return true;
     if (cur.index >= space->capacity) return false;
-    cur = space->nodes[cur.index].parent;
+    cur = space->parents[cur.index];
   }
   return false;
 }
@@ -382,176 +506,260 @@ spatial__is_descendant(const spatial_space_t *space,
 SPATIAL_EXPORT
 bool
 spatial_node_attach(spatial_space_t * __restrict space,
-                 spatial_node_t                child,
-                 spatial_node_t                new_parent) {
-  spatial_node_data_t *c, *p;
-
+                    spatial_node_t                child,
+                    spatial_node_t                new_parent) {
   if (!spatial_node_valid(space, child))      return false;
   if (spatial_node_is_null(new_parent))       new_parent = space->root;
   if (!spatial_node_valid(space, new_parent)) return false;
   if (spatial_node_eq(child, new_parent))     return false;
-
-  /* cycle check: new_parent must not descend from child */
   if (spatial__is_descendant(space, child, new_parent)) return false;
 
   spatial__unlink_from_parent(space, child);
 
-  c = &space->nodes[child.index];
-  p = &space->nodes[new_parent.index];
-  c->parent       = new_parent;
-  c->next_sibling = p->first_child;
-  p->first_child  = child;
+  space->parents[child.index]              = new_parent;
+  space->next_siblings[child.index]        = space->first_children[new_parent.index];
+  space->first_children[new_parent.index]  = child;
 
-  c->flags |= SPATIAL_NODE_DIRTY_LOCAL;
+  space->flags[child.index] |= SPATIAL_NODE_DIRTY_LOCAL;
   spatial__push_dirty(space, child);
+  return true;
+}
+
+/* ============================================================== */
+/* Accessors.                                                       */
+/* ============================================================== */
+
+SPATIAL_EXPORT
+void
+spatial_node_set_local(spatial_space_t      * __restrict space,
+                       spatial_node_t                    handle,
+                       const spatial_pose_t * __restrict local) {
+  if (!spatial_node_valid(space, handle) || !local) return;
+  glm_vec3_copy((float *)local->position, space->local_positions[handle.index]);
+  glm_quat_copy((float *)local->rotation, space->local_rotations[handle.index]);
+  glm_vec3_copy((float *)local->scale,    space->local_scales[handle.index]);
+  space->flags[handle.index] |= SPATIAL_NODE_DIRTY_LOCAL;
+  spatial__push_dirty(space, handle);
+}
+
+SPATIAL_EXPORT
+bool
+spatial_node_get_local(const spatial_space_t * __restrict space,
+                       spatial_node_t                    handle,
+                       spatial_pose_t       * __restrict out) {
+  if (!spatial_node_valid(space, handle) || !out) return false;
+  glm_vec3_copy(space->local_positions[handle.index], out->position);
+  glm_quat_copy(space->local_rotations[handle.index], out->rotation);
+  glm_vec3_copy(space->local_scales[handle.index],    out->scale);
   return true;
 }
 
 SPATIAL_EXPORT
 void
-spatial_node_set_local(spatial_space_t      * __restrict space,
-                    spatial_node_t                    handle,
-                    const spatial_pose_t * __restrict local) {
-  spatial_node_data_t *n = spatial_node_get(space, handle);
-  if (!n || !local) return;
-  n->local = *local;
-  n->flags |= SPATIAL_NODE_DIRTY_LOCAL;
-  spatial__push_dirty(space, handle);
-}
-
-SPATIAL_EXPORT
-void
 spatial_node_set_world_physics(spatial_space_t      * __restrict space,
-                            spatial_node_t                    handle,
-                            const spatial_pose_t * __restrict world) {
-  spatial_node_data_t *n = spatial_node_get(space, handle);
-  if (!n || !world) return;
-  n->world = *world;
-  n->flags |= SPATIAL_NODE_DIRTY_WORLD | SPATIAL_NODE_PHYSICS_OWNS;
+                               spatial_node_t                    handle,
+                               const spatial_pose_t * __restrict world) {
+  if (!spatial_node_valid(space, handle) || !world) return;
+  glm_vec3_copy((float *)world->position, space->world_positions[handle.index]);
+  glm_quat_copy((float *)world->rotation, space->world_rotations[handle.index]);
+  glm_vec3_copy((float *)world->scale,    space->world_scales[handle.index]);
+  space->flags[handle.index] |= SPATIAL_NODE_DIRTY_WORLD | SPATIAL_NODE_PHYSICS_OWNS;
   spatial__push_dirty(space, handle);
 }
 
 SPATIAL_EXPORT
 bool
 spatial_node_get_world(const spatial_space_t * __restrict space,
-                    spatial_node_t                    handle,
-                    spatial_pose_t        * __restrict out) {
+                       spatial_node_t                    handle,
+                       spatial_pose_t       * __restrict out) {
   if (!spatial_node_valid(space, handle) || !out) return false;
-  *out = space->nodes[handle.index].world;
+  glm_vec3_copy(space->world_positions[handle.index], out->position);
+  glm_quat_copy(space->world_rotations[handle.index], out->rotation);
+  glm_vec3_copy(space->world_scales[handle.index],    out->scale);
   return true;
+}
+
+SPATIAL_EXPORT
+bool
+spatial_node_get_world_matrix(const spatial_space_t * __restrict space,
+                              spatial_node_t                    handle,
+                              mat4                              out) {
+  if (!spatial_node_valid(space, handle)) return false;
+  glm_mat4_copy((vec4 *)space->world_matrices[handle.index], out);
+  return true;
+}
+
+SPATIAL_EXPORT
+uint32_t
+spatial_node_get_flags(const spatial_space_t *space, spatial_node_t handle) {
+  if (!spatial_node_valid(space, handle)) return 0;
+  return space->flags[handle.index];
+}
+
+SPATIAL_EXPORT
+uint32_t
+spatial_node_get_version(const spatial_space_t *space, spatial_node_t handle) {
+  if (!spatial_node_valid(space, handle)) return 0;
+  return space->versions[handle.index];
+}
+
+SPATIAL_EXPORT
+spatial_node_t
+spatial_node_get_parent(const spatial_space_t *space, spatial_node_t handle) {
+  if (!spatial_node_valid(space, handle)) return SPATIAL_NODE_NULL;
+  return space->parents[handle.index];
+}
+
+SPATIAL_EXPORT
+void
+spatial_node_set_user(spatial_space_t *space, spatial_node_t handle, void *user) {
+  if (!spatial_node_valid(space, handle)) return;
+  space->users[handle.index] = user;
+}
+
+SPATIAL_EXPORT
+void *
+spatial_node_get_user(const spatial_space_t *space, spatial_node_t handle) {
+  if (!spatial_node_valid(space, handle)) return NULL;
+  return space->users[handle.index];
 }
 
 SPATIAL_EXPORT
 void
 spatial_node_set_matrix(spatial_space_t * __restrict space,
                         spatial_node_t                handle,
-                        const mat4                    local_matrix) {
-  spatial_node_data_t *n = spatial_node_get(space, handle);
-  if (!n) return;
+                        const mat4                    local) {
+  spatial_pose_t pose;
+  if (!spatial_node_valid(space, handle)) return;
 
-  if (!n->matrix_override) {
-    n->matrix_override = calloc(1, sizeof(spatial_matrix_override_t));
+  if (!space->matrix_overrides[handle.index]) {
+    space->matrix_overrides[handle.index] = calloc(1, sizeof(spatial_matrix_override_t));
   }
-  glm_mat4_copy((vec4 *)local_matrix, n->matrix_override->local);
+  glm_mat4_copy((vec4 *)local, space->matrix_overrides[handle.index]->local);
 
-  /* best-effort decompose into pose for readers that don't know matrix path */
-  spatial_mat4_to_pose(local_matrix, &n->local);
+  /* best-effort pose decomposition for readers that ignore matrix path */
+  spatial_mat4_to_pose(local, &pose);
+  glm_vec3_copy(pose.position, space->local_positions[handle.index]);
+  glm_quat_copy(pose.rotation, space->local_rotations[handle.index]);
+  glm_vec3_copy(pose.scale,    space->local_scales[handle.index]);
 
-  n->flags |= SPATIAL_NODE_HAS_MATRIX | SPATIAL_NODE_DIRTY_LOCAL;
+  space->flags[handle.index] |= SPATIAL_NODE_HAS_MATRIX | SPATIAL_NODE_DIRTY_LOCAL;
   spatial__push_dirty(space, handle);
 }
 
 SPATIAL_EXPORT
 void
-spatial_node_clear_matrix(spatial_space_t * __restrict space,
-                          spatial_node_t                handle) {
-  spatial_node_data_t *n = spatial_node_get(space, handle);
-  if (!n) return;
-  if (n->matrix_override) {
-    free(n->matrix_override);
-    n->matrix_override = NULL;
+spatial_node_clear_matrix(spatial_space_t *space, spatial_node_t handle) {
+  if (!spatial_node_valid(space, handle)) return;
+  if (space->matrix_overrides[handle.index]) {
+    free(space->matrix_overrides[handle.index]);
+    space->matrix_overrides[handle.index] = NULL;
   }
-  n->flags &= ~SPATIAL_NODE_HAS_MATRIX;
-  n->flags |= SPATIAL_NODE_DIRTY_LOCAL;
+  space->flags[handle.index] &= ~SPATIAL_NODE_HAS_MATRIX;
+  space->flags[handle.index] |= SPATIAL_NODE_DIRTY_LOCAL;
   spatial__push_dirty(space, handle);
 }
 
-/* --------------------------------------------------------------- */
-/* Update traversal. See spec/update.md.                            */
-/* --------------------------------------------------------------- */
-
-static
-bool
-spatial__pose_differs(const spatial_pose_t *a, const spatial_pose_t *b) {
-  const float eps = 1e-7f;
-  int i;
-
-  for (i = 0; i < 3; i++) {
-    if (fabsf(a->position[i] - b->position[i]) > eps) return true;
-    if (fabsf(a->scale[i]    - b->scale[i])    > eps) return true;
-  }
-  for (i = 0; i < 4; i++) {
-    if (fabsf(a->rotation[i] - b->rotation[i]) > eps) return true;
-  }
-  return false;
-}
+/* ============================================================== */
+/* Update traversal (iterative, explicit stack).                    */
+/* ============================================================== */
 
 static
 void
-spatial__traverse(spatial_space_t * __restrict space, spatial_node_t handle, bool parent_changed) {
-  spatial_node_data_t *n;
-  spatial_pose_t       new_world;
-  bool              changed;
+spatial__traverse_iter(spatial_space_t *space, spatial_node_t start) {
+  spatial__trav_t *stack;
+  uint32_t         sp = 0;
+  const uint32_t   dirty_mask = SPATIAL_NODE_DIRTY_LOCAL | SPATIAL_NODE_DIRTY_WORLD;
 
-  if (!spatial_node_valid(space, handle)) return;
-  n = &space->nodes[handle.index];
+  if (!spatial_node_valid(space, start)) return;
 
-  if (n->flags & SPATIAL_NODE_HAS_MATRIX) {
-    /* Matrix-override path. world_matrix is authoritative; pose is a
-     * best-effort view for readers that don't know about matrix mode. */
-    if (spatial_node_is_null(n->parent)) {
-      glm_mat4_copy(n->matrix_override->local, n->world_matrix);
+  /* initial stack size: max of capacity (depth can't exceed node count) */
+  spatial__ensure_trav_capacity(space, space->capacity);
+  stack = (spatial__trav_t *)space->trav_stack;
+  stack[sp++] = (spatial__trav_t){ start, 0u };
+
+  while (sp > 0) {
+    spatial__trav_t e     = stack[--sp];
+    uint32_t        idx   = e.node.index;
+    uint32_t        flags = space->flags[idx];
+    bool            changed;
+    spatial_node_t  child;
+
+    if (SPATIAL_UNLIKELY(!(flags & SPATIAL_NODE_ALIVE))) continue;
+
+    if (SPATIAL_UNLIKELY(flags & SPATIAL_NODE_HAS_MATRIX)) {
+      mat4 *local_m = &space->matrix_overrides[idx]->local;
+      spatial_node_t parent = space->parents[idx];
+      if (spatial_node_is_null(parent)) {
+        glm_mat4_copy(*local_m, space->world_matrices[idx]);
+      } else {
+        glm_mat4_mul(space->world_matrices[parent.index], *local_m,
+                     space->world_matrices[idx]);
+      }
+      /* best-effort decompose world mat into world pose */
+      {
+        spatial_pose_t wp;
+        spatial_mat4_to_pose(space->world_matrices[idx], &wp);
+        glm_vec3_copy(wp.position, space->world_positions[idx]);
+        glm_quat_copy(wp.rotation, space->world_rotations[idx]);
+        glm_vec3_copy(wp.scale,    space->world_scales[idx]);
+      }
+      space->versions[idx]++;
+      changed = true;
+    } else if (flags & SPATIAL_NODE_PHYSICS_OWNS) {
+      /* world written externally. Refresh matrix from world pose. */
+      spatial__pose_slots_to_mat4(space->world_positions[idx],
+                                  space->world_rotations[idx],
+                                  space->world_scales[idx],
+                                  space->world_matrices[idx]);
+      space->versions[idx]++;
+      changed = true;
     } else {
-      spatial_node_data_t *p = &space->nodes[n->parent.index];
-      glm_mat4_mul(p->world_matrix, n->matrix_override->local, n->world_matrix);
+      vec3   new_p, new_s;
+      versor new_q;
+      spatial_node_t parent = space->parents[idx];
+
+      if (spatial_node_is_null(parent)) {
+        glm_vec3_copy(space->local_positions[idx], new_p);
+        glm_quat_copy(space->local_rotations[idx], new_q);
+        glm_vec3_copy(space->local_scales[idx],    new_s);
+      } else {
+        spatial__compose_slots(space->world_positions[parent.index],
+                               space->world_rotations[parent.index],
+                               space->world_scales[parent.index],
+                               space->local_positions[idx],
+                               space->local_rotations[idx],
+                               space->local_scales[idx],
+                               new_p, new_q, new_s);
+      }
+
+      changed = e.parent_changed
+             || (flags & dirty_mask)
+             || spatial__pose_slots_differ(space->world_positions[idx],
+                                           space->world_rotations[idx],
+                                           space->world_scales[idx],
+                                           new_p, new_q, new_s);
+
+      if (changed) {
+        glm_vec3_copy(new_p, space->world_positions[idx]);
+        glm_quat_copy(new_q, space->world_rotations[idx]);
+        glm_vec3_copy(new_s, space->world_scales[idx]);
+        spatial__pose_slots_to_mat4(new_p, new_q, new_s, space->world_matrices[idx]);
+        space->versions[idx]++;
+      }
     }
-    spatial_mat4_to_pose(n->world_matrix, &n->world);
-    changed = true;
-    n->version++;
-  } else {
-    if (n->flags & SPATIAL_NODE_PHYSICS_OWNS) {
-      new_world = n->world;
-    } else if (spatial_node_is_null(n->parent)) {
-      new_world = n->local;
-    } else {
-      spatial_node_data_t *p = &space->nodes[n->parent.index];
-      spatial_pose_compose(&p->world, &n->local, &new_world);
-    }
 
-    changed = parent_changed
-           || (n->flags & (SPATIAL_NODE_DIRTY_LOCAL | SPATIAL_NODE_DIRTY_WORLD))
-           || spatial__pose_differs(&new_world, &n->world);
+    space->flags[idx] = flags & ~dirty_mask;
 
-    if (changed) {
-      n->world = new_world;
-      spatial_pose_to_mat4(&n->world, n->world_matrix);
-      n->version++;
-    }
-  }
-
-  n->flags &= ~(SPATIAL_NODE_DIRTY_LOCAL | SPATIAL_NODE_DIRTY_WORLD);
-
-  /* recurse into children */
-  {
-    spatial_node_t child = n->first_child;
+    /* push children */
+    child = space->first_children[idx];
     while (!spatial_node_is_null(child)) {
-      spatial_node_data_t *cd;
-      spatial_node_t next;
-      if (!spatial_node_valid(space, child)) break;
-      cd   = &space->nodes[child.index];
-      next = cd->next_sibling;
-      spatial__traverse(space, child, changed);
-      child = next;
+      if (SPATIAL_UNLIKELY(sp >= space->trav_capacity)) {
+        spatial__ensure_trav_capacity(space, space->trav_capacity * 2);
+        stack = (spatial__trav_t *)space->trav_stack;
+      }
+      stack[sp++] = (spatial__trav_t){ child, changed ? 1u : 0u };
+      child = space->next_siblings[child.index];
     }
   }
 }
@@ -564,36 +772,61 @@ spatial_update(spatial_space_t * __restrict space) {
   if (!space) return;
 
   for (i = 0; i < space->dirty_count; i++) {
-    spatial__traverse(space, space->dirty_roots[i], false);
+    spatial__traverse_iter(space, space->dirty_roots[i]);
   }
 
   space->dirty_count = 0;
   space->update_version++;
 }
 
-/* ================================================================== */
-/* 2D implementation. Mirrors the 3D API with suffix _2.              */
-/* ================================================================== */
+/* ================================================================ */
+/* 2D implementation. Parallel SoA, parallel API, suffix _2.         */
+/* ================================================================ */
+
+static
+void
+spatial__grow_arrays2(spatial_space2_t *space, uint32_t new_cap) {
+  uint32_t old_cap = space->capacity;
+
+  space->generations     = realloc(space->generations,     sizeof(uint32_t)       * new_cap);
+  space->parents         = realloc(space->parents,         sizeof(spatial_node_t) * new_cap);
+  space->first_children  = realloc(space->first_children,  sizeof(spatial_node_t) * new_cap);
+  space->next_siblings   = realloc(space->next_siblings,   sizeof(spatial_node_t) * new_cap);
+  space->local_positions = realloc(space->local_positions, sizeof(vec2)           * new_cap);
+  space->local_rotations = realloc(space->local_rotations, sizeof(spatial_rot2_t) * new_cap);
+  space->local_scales    = realloc(space->local_scales,    sizeof(vec2)           * new_cap);
+  space->world_positions = realloc(space->world_positions, sizeof(vec2)           * new_cap);
+  space->world_rotations = realloc(space->world_rotations, sizeof(spatial_rot2_t) * new_cap);
+  space->world_scales    = realloc(space->world_scales,    sizeof(vec2)           * new_cap);
+  space->world_matrices  = realloc(space->world_matrices,  sizeof(mat3)           * new_cap);
+  space->flags           = realloc(space->flags,           sizeof(uint32_t)       * new_cap);
+  space->versions        = realloc(space->versions,        sizeof(uint32_t)       * new_cap);
+  space->users           = realloc(space->users,           sizeof(void *)         * new_cap);
+
+  if (new_cap > old_cap) {
+    uint32_t delta = new_cap - old_cap;
+    memset(space->generations    + old_cap, 0, sizeof(uint32_t)       * delta);
+    memset(space->parents        + old_cap, 0, sizeof(spatial_node_t) * delta);
+    memset(space->first_children + old_cap, 0, sizeof(spatial_node_t) * delta);
+    memset(space->next_siblings  + old_cap, 0, sizeof(spatial_node_t) * delta);
+    memset(space->flags          + old_cap, 0, sizeof(uint32_t)       * delta);
+    memset(space->versions       + old_cap, 0, sizeof(uint32_t)       * delta);
+    memset(space->users          + old_cap, 0, sizeof(void *)         * delta);
+  }
+
+  space->capacity = new_cap;
+}
 
 static
 uint32_t
-spatial__alloc_slot2(spatial_space2_t * __restrict space) {
+spatial__alloc_slot2(spatial_space2_t *space) {
   uint32_t slot;
   if (space->free_head != 0) {
     slot = space->free_head;
-    space->free_head = space->nodes[slot].parent.index;
+    space->free_head = space->parents[slot].index;
   } else {
-    if (space->count >= space->capacity) {
-      uint32_t new_cap = space->capacity * 2;
-      space->nodes       = realloc(space->nodes,
-                                   sizeof(spatial_node_data2_t) * new_cap);
-      space->generations = realloc(space->generations,
-                                   sizeof(uint32_t) * new_cap);
-      memset(space->nodes + space->capacity, 0,
-             sizeof(spatial_node_data2_t) * (new_cap - space->capacity));
-      memset(space->generations + space->capacity, 0,
-             sizeof(uint32_t) * (new_cap - space->capacity));
-      space->capacity = new_cap;
+    if (SPATIAL_UNLIKELY(space->count >= space->capacity)) {
+      spatial__grow_arrays2(space, space->capacity * 2);
     }
     slot = space->count++;
   }
@@ -602,111 +835,144 @@ spatial__alloc_slot2(spatial_space2_t * __restrict space) {
 
 static
 void
-spatial__push_dirty2(spatial_space2_t * __restrict space, spatial_node_t node) {
-  if (space->dirty_count >= space->dirty_capacity) {
-    uint32_t new_cap = space->dirty_capacity * 2;
-    space->dirty_roots    = realloc(space->dirty_roots,
-                                    sizeof(spatial_node_t) * new_cap);
-    space->dirty_capacity = new_cap;
+spatial__push_dirty2(spatial_space2_t *space, spatial_node_t handle) {
+  spatial_node_t a;
+  const uint32_t dirty_mask = SPATIAL_NODE_DIRTY_LOCAL | SPATIAL_NODE_DIRTY_WORLD;
+
+  a = space->parents[handle.index];
+  while (!spatial_node_is_null(a)) {
+    if (a.index >= space->capacity) break;
+    if (space->flags[a.index] & dirty_mask) return;
+    a = space->parents[a.index];
   }
-  space->dirty_roots[space->dirty_count++] = node;
+
+  if (SPATIAL_UNLIKELY(space->dirty_count >= space->dirty_capacity)) {
+    uint32_t nc = space->dirty_capacity * 2;
+    space->dirty_roots    = realloc(space->dirty_roots, sizeof(spatial_node_t) * nc);
+    space->dirty_capacity = nc;
+  }
+  space->dirty_roots[space->dirty_count++] = handle;
+}
+
+static
+void
+spatial__ensure_trav_capacity2(spatial_space2_t *space, uint32_t want) {
+  if (space->trav_capacity < want) {
+    uint32_t nc = space->trav_capacity ? space->trav_capacity : SPATIAL_INITIAL_TRAV_CAPACITY;
+    while (nc < want) nc *= 2;
+    space->trav_stack    = realloc(space->trav_stack, sizeof(spatial__trav_t) * nc);
+    space->trav_capacity = nc;
+  }
 }
 
 SPATIAL_EXPORT
 spatial_space2_t *
 spatial_space2_create(uint32_t initial_capacity) {
   spatial_space2_t *space;
+  uint32_t          slot;
 
   if (initial_capacity < 2) initial_capacity = 16;
 
   space = calloc(1, sizeof(spatial_space2_t));
-  space->nodes       = calloc(initial_capacity, sizeof(spatial_node_data2_t));
-  space->generations = calloc(initial_capacity, sizeof(uint32_t));
-  space->capacity    = initial_capacity;
-  space->count       = 1;
-  space->free_head   = 0;
+  space->count     = 1;
+  space->free_head = 0;
+  spatial__grow_arrays2(space, initial_capacity);
 
-  space->dirty_roots    = calloc(SPATIAL_INITIAL_DIRTY_CAPACITY,
-                                 sizeof(spatial_node_t));
+  space->dirty_roots    = calloc(SPATIAL_INITIAL_DIRTY_CAPACITY, sizeof(spatial_node_t));
   space->dirty_capacity = SPATIAL_INITIAL_DIRTY_CAPACITY;
 
-  {
-    uint32_t slot = spatial__alloc_slot2(space);
-    spatial_node_data2_t *n = &space->nodes[slot];
-    n->parent       = SPATIAL_NODE_NULL;
-    n->first_child  = SPATIAL_NODE_NULL;
-    n->next_sibling = SPATIAL_NODE_NULL;
-    n->local        = SPATIAL_POSE2_IDENTITY;
-    n->world        = SPATIAL_POSE2_IDENTITY;
-    glm_mat3_identity(n->world_matrix);
-    n->flags        = SPATIAL_NODE_ALIVE;
-    n->version      = 1;
-    space->generations[slot] = 1;
-    space->root = (spatial_node_t){ .index = slot, .generation = 1 };
-  }
+  slot = spatial__alloc_slot2(space);
+  space->parents[slot]        = SPATIAL_NODE_NULL;
+  space->first_children[slot] = SPATIAL_NODE_NULL;
+  space->next_siblings[slot]  = SPATIAL_NODE_NULL;
+  space->local_positions[slot][0] = 0; space->local_positions[slot][1] = 0;
+  space->local_rotations[slot]    = (spatial_rot2_t){ .c = 1.0f, .s = 0.0f };
+  space->local_scales[slot][0]    = 1; space->local_scales[slot][1]    = 1;
+  space->world_positions[slot][0] = 0; space->world_positions[slot][1] = 0;
+  space->world_rotations[slot]    = (spatial_rot2_t){ .c = 1.0f, .s = 0.0f };
+  space->world_scales[slot][0]    = 1; space->world_scales[slot][1]    = 1;
+  glm_mat3_identity(space->world_matrices[slot]);
+  space->flags[slot]       = SPATIAL_NODE_ALIVE;
+  space->versions[slot]    = 1;
+  space->users[slot]       = NULL;
+  space->generations[slot] = 1;
+  space->root = (spatial_node_t){ .index = slot, .generation = 1 };
 
   return space;
 }
 
 SPATIAL_EXPORT
 void
-spatial_space2_destroy(spatial_space2_t * space) {
+spatial_space2_destroy(spatial_space2_t *space) {
   if (!space) return;
-  free(space->nodes);
   free(space->generations);
+  free(space->parents);
+  free(space->first_children);
+  free(space->next_siblings);
+  free(space->local_positions);
+  free(space->local_rotations);
+  free(space->local_scales);
+  free(space->world_positions);
+  free(space->world_rotations);
+  free(space->world_scales);
+  free(space->world_matrices);
+  free(space->flags);
+  free(space->versions);
+  free(space->users);
   free(space->dirty_roots);
+  free(space->trav_stack);
   free(space);
 }
 
 SPATIAL_EXPORT
 bool
 spatial_node2_valid(const spatial_space2_t *space, spatial_node_t handle) {
-  if (handle.index == 0 || handle.index >= space->capacity) return false;
-  if (space->generations[handle.index] != handle.generation) return false;
-  return (space->nodes[handle.index].flags & SPATIAL_NODE_ALIVE) != 0;
-}
-
-SPATIAL_EXPORT
-spatial_node_data2_t *
-spatial_node2_get(spatial_space2_t *space, spatial_node_t handle) {
-  if (!spatial_node2_valid(space, handle)) return NULL;
-  return &space->nodes[handle.index];
+  if (SPATIAL_UNLIKELY(handle.index == 0 || handle.index >= space->capacity)) return false;
+  if (SPATIAL_UNLIKELY(space->generations[handle.index] != handle.generation)) return false;
+  return (space->flags[handle.index] & SPATIAL_NODE_ALIVE) != 0;
 }
 
 SPATIAL_EXPORT
 spatial_node_t
-spatial_node2_create(spatial_space2_t       * __restrict space,
-                     spatial_node_t                       parent,
-                     const spatial_pose2_t  * __restrict  local) {
-  uint32_t              slot;
-  spatial_node_data2_t *n;
-  spatial_node_t        handle;
+spatial_node2_create(spatial_space2_t       *space,
+                     spatial_node_t          parent,
+                     const spatial_pose2_t  *local) {
+  uint32_t       slot;
+  spatial_node_t handle;
 
   if (spatial_node_is_null(parent)) parent = space->root;
-  if (!spatial_node2_valid(space, parent)) return SPATIAL_NODE_NULL;
+  if (SPATIAL_UNLIKELY(!spatial_node2_valid(space, parent))) return SPATIAL_NODE_NULL;
 
   slot = spatial__alloc_slot2(space);
-  n    = &space->nodes[slot];
 
-  n->parent       = parent;
-  n->first_child  = SPATIAL_NODE_NULL;
-  n->next_sibling = SPATIAL_NODE_NULL;
-  n->local        = local ? *local : SPATIAL_POSE2_IDENTITY;
-  n->world        = SPATIAL_POSE2_IDENTITY;
-  glm_mat3_identity(n->world_matrix);
-  n->flags        = SPATIAL_NODE_ALIVE | SPATIAL_NODE_DIRTY_LOCAL;
-  n->version      = 1;
-  n->user         = NULL;
+  space->parents[slot]          = parent;
+  space->first_children[slot]   = SPATIAL_NODE_NULL;
+  space->next_siblings[slot]    = space->first_children[parent.index];
+  space->first_children[parent.index] = (spatial_node_t){ .index = slot, .generation = 0 };
+
+  if (local) {
+    space->local_positions[slot][0] = local->position[0];
+    space->local_positions[slot][1] = local->position[1];
+    space->local_rotations[slot]    = local->rotation;
+    space->local_scales[slot][0]    = local->scale[0];
+    space->local_scales[slot][1]    = local->scale[1];
+  } else {
+    space->local_positions[slot][0] = 0; space->local_positions[slot][1] = 0;
+    space->local_rotations[slot]    = (spatial_rot2_t){ .c = 1.0f, .s = 0.0f };
+    space->local_scales[slot][0]    = 1; space->local_scales[slot][1]    = 1;
+  }
+  space->world_positions[slot][0] = 0; space->world_positions[slot][1] = 0;
+  space->world_rotations[slot]    = (spatial_rot2_t){ .c = 1.0f, .s = 0.0f };
+  space->world_scales[slot][0]    = 1; space->world_scales[slot][1]    = 1;
+  glm_mat3_identity(space->world_matrices[slot]);
+  space->flags[slot]    = SPATIAL_NODE_ALIVE | SPATIAL_NODE_DIRTY_LOCAL;
+  space->versions[slot] = 1;
+  space->users[slot]    = NULL;
 
   space->generations[slot]++;
-  if (space->generations[slot] == 0) space->generations[slot] = 1;
+  if (SPATIAL_UNLIKELY(space->generations[slot] == 0)) space->generations[slot] = 1;
   handle = (spatial_node_t){ .index = slot, .generation = space->generations[slot] };
-
-  {
-    spatial_node_data2_t *p = &space->nodes[parent.index];
-    n->next_sibling = p->first_child;
-    p->first_child  = handle;
-  }
+  space->first_children[parent.index] = handle;
 
   spatial__push_dirty2(space, handle);
   return handle;
@@ -715,54 +981,48 @@ spatial_node2_create(spatial_space2_t       * __restrict space,
 static
 void
 spatial__unlink_from_parent2(spatial_space2_t *space, spatial_node_t handle) {
-  spatial_node_data2_t *n, *p;
-  spatial_node_t        cur;
+  spatial_node_t parent, cur;
 
-  n = &space->nodes[handle.index];
-  if (spatial_node_is_null(n->parent)) return;
+  parent = space->parents[handle.index];
+  if (spatial_node_is_null(parent)) return;
 
-  p = &space->nodes[n->parent.index];
-  if (spatial_node_eq(p->first_child, handle)) {
-    p->first_child = n->next_sibling;
+  if (spatial_node_eq(space->first_children[parent.index], handle)) {
+    space->first_children[parent.index] = space->next_siblings[handle.index];
   } else {
-    cur = p->first_child;
+    cur = space->first_children[parent.index];
     while (!spatial_node_is_null(cur)) {
-      spatial_node_data2_t *cd = &space->nodes[cur.index];
-      if (spatial_node_eq(cd->next_sibling, handle)) {
-        cd->next_sibling = n->next_sibling;
+      if (spatial_node_eq(space->next_siblings[cur.index], handle)) {
+        space->next_siblings[cur.index] = space->next_siblings[handle.index];
         break;
       }
-      cur = cd->next_sibling;
+      cur = space->next_siblings[cur.index];
     }
   }
-  n->next_sibling = SPATIAL_NODE_NULL;
+  space->next_siblings[handle.index] = SPATIAL_NODE_NULL;
 }
 
 SPATIAL_EXPORT
 void
 spatial_node2_destroy(spatial_space2_t *space, spatial_node_t handle) {
-  spatial_node_data2_t *n;
-  spatial_node_t        child;
+  spatial_node_t child;
 
   if (!spatial_node2_valid(space, handle)) return;
   if (spatial_node_eq(handle, space->root)) return;
 
-  n = &space->nodes[handle.index];
-
-  child = n->first_child;
+  child = space->first_children[handle.index];
   while (!spatial_node_is_null(child)) {
-    spatial_node_t next = space->nodes[child.index].next_sibling;
+    spatial_node_t next = space->next_siblings[child.index];
     spatial_node2_destroy(space, child);
     child = next;
   }
 
   spatial__unlink_from_parent2(space, handle);
 
-  n->flags = 0;
-  n->parent.index = space->free_head;
+  space->flags[handle.index] = 0;
+  space->parents[handle.index] = (spatial_node_t){ .index = space->free_head, .generation = 0 };
   space->free_head = handle.index;
   space->generations[handle.index]++;
-  if (space->generations[handle.index] == 0) space->generations[handle.index] = 1;
+  if (SPATIAL_UNLIKELY(space->generations[handle.index] == 0)) space->generations[handle.index] = 1;
 }
 
 static
@@ -774,7 +1034,7 @@ spatial__is_descendant2(const spatial_space2_t *space,
   while (!spatial_node_is_null(cur)) {
     if (spatial_node_eq(cur, root)) return true;
     if (cur.index >= space->capacity) return false;
-    cur = space->nodes[cur.index].parent;
+    cur = space->parents[cur.index];
   }
   return false;
 }
@@ -784,8 +1044,6 @@ bool
 spatial_node2_attach(spatial_space2_t *space,
                      spatial_node_t    child,
                      spatial_node_t    new_parent) {
-  spatial_node_data2_t *c, *p;
-
   if (!spatial_node2_valid(space, child))      return false;
   if (spatial_node_is_null(new_parent))        new_parent = space->root;
   if (!spatial_node2_valid(space, new_parent)) return false;
@@ -794,119 +1052,217 @@ spatial_node2_attach(spatial_space2_t *space,
 
   spatial__unlink_from_parent2(space, child);
 
-  c = &space->nodes[child.index];
-  p = &space->nodes[new_parent.index];
-  c->parent       = new_parent;
-  c->next_sibling = p->first_child;
-  p->first_child  = child;
+  space->parents[child.index]             = new_parent;
+  space->next_siblings[child.index]       = space->first_children[new_parent.index];
+  space->first_children[new_parent.index] = child;
 
-  c->flags |= SPATIAL_NODE_DIRTY_LOCAL;
+  space->flags[child.index] |= SPATIAL_NODE_DIRTY_LOCAL;
   spatial__push_dirty2(space, child);
   return true;
 }
 
 SPATIAL_EXPORT
 void
-spatial_node2_set_local(spatial_space2_t       * __restrict space,
-                        spatial_node_t                       handle,
-                        const spatial_pose2_t  * __restrict  local) {
-  spatial_node_data2_t *n = spatial_node2_get(space, handle);
-  if (!n || !local) return;
-  n->local = *local;
-  n->flags |= SPATIAL_NODE_DIRTY_LOCAL;
+spatial_node2_set_local(spatial_space2_t       *space,
+                        spatial_node_t          handle,
+                        const spatial_pose2_t  *local) {
+  if (!spatial_node2_valid(space, handle) || !local) return;
+  space->local_positions[handle.index][0] = local->position[0];
+  space->local_positions[handle.index][1] = local->position[1];
+  space->local_rotations[handle.index]    = local->rotation;
+  space->local_scales[handle.index][0]    = local->scale[0];
+  space->local_scales[handle.index][1]    = local->scale[1];
+  space->flags[handle.index] |= SPATIAL_NODE_DIRTY_LOCAL;
   spatial__push_dirty2(space, handle);
 }
 
 SPATIAL_EXPORT
+bool
+spatial_node2_get_local(const spatial_space2_t *space,
+                        spatial_node_t          handle,
+                        spatial_pose2_t        *out) {
+  if (!spatial_node2_valid(space, handle) || !out) return false;
+  out->position[0] = space->local_positions[handle.index][0];
+  out->position[1] = space->local_positions[handle.index][1];
+  out->rotation    = space->local_rotations[handle.index];
+  out->scale[0]    = space->local_scales[handle.index][0];
+  out->scale[1]    = space->local_scales[handle.index][1];
+  return true;
+}
+
+SPATIAL_EXPORT
 void
-spatial_node2_set_world_physics(spatial_space2_t       * __restrict space,
-                                spatial_node_t                       handle,
-                                const spatial_pose2_t  * __restrict  world) {
-  spatial_node_data2_t *n = spatial_node2_get(space, handle);
-  if (!n || !world) return;
-  n->world = *world;
-  n->flags |= SPATIAL_NODE_DIRTY_WORLD | SPATIAL_NODE_PHYSICS_OWNS;
+spatial_node2_set_world_physics(spatial_space2_t       *space,
+                                spatial_node_t          handle,
+                                const spatial_pose2_t  *world) {
+  if (!spatial_node2_valid(space, handle) || !world) return;
+  space->world_positions[handle.index][0] = world->position[0];
+  space->world_positions[handle.index][1] = world->position[1];
+  space->world_rotations[handle.index]    = world->rotation;
+  space->world_scales[handle.index][0]    = world->scale[0];
+  space->world_scales[handle.index][1]    = world->scale[1];
+  space->flags[handle.index] |= SPATIAL_NODE_DIRTY_WORLD | SPATIAL_NODE_PHYSICS_OWNS;
   spatial__push_dirty2(space, handle);
 }
 
 SPATIAL_EXPORT
 bool
 spatial_node2_get_world(const spatial_space2_t *space,
-                        spatial_node_t         handle,
-                        spatial_pose2_t       *out) {
+                        spatial_node_t          handle,
+                        spatial_pose2_t        *out) {
   if (!spatial_node2_valid(space, handle) || !out) return false;
-  *out = space->nodes[handle.index].world;
+  out->position[0] = space->world_positions[handle.index][0];
+  out->position[1] = space->world_positions[handle.index][1];
+  out->rotation    = space->world_rotations[handle.index];
+  out->scale[0]    = space->world_scales[handle.index][0];
+  out->scale[1]    = space->world_scales[handle.index][1];
   return true;
 }
 
-static
+SPATIAL_EXPORT
 bool
-spatial__pose2_differs(const spatial_pose2_t *a, const spatial_pose2_t *b) {
+spatial_node2_get_world_matrix(const spatial_space2_t *space,
+                               spatial_node_t          handle,
+                               mat3                    out) {
+  if (!spatial_node2_valid(space, handle)) return false;
+  glm_mat3_copy((vec3 *)space->world_matrices[handle.index], out);
+  return true;
+}
+
+SPATIAL_EXPORT
+uint32_t
+spatial_node2_get_flags(const spatial_space2_t *space, spatial_node_t handle) {
+  if (!spatial_node2_valid(space, handle)) return 0;
+  return space->flags[handle.index];
+}
+
+SPATIAL_EXPORT
+uint32_t
+spatial_node2_get_version(const spatial_space2_t *space, spatial_node_t handle) {
+  if (!spatial_node2_valid(space, handle)) return 0;
+  return space->versions[handle.index];
+}
+
+SPATIAL_EXPORT
+spatial_node_t
+spatial_node2_get_parent(const spatial_space2_t *space, spatial_node_t handle) {
+  if (!spatial_node2_valid(space, handle)) return SPATIAL_NODE_NULL;
+  return space->parents[handle.index];
+}
+
+static SPATIAL_INLINE
+bool
+spatial__pose2_slots_differ(const vec2 pa, spatial_rot2_t ra, const vec2 sa,
+                            const vec2 pb, spatial_rot2_t rb, const vec2 sb) {
   const float eps = 1e-7f;
-  if (fabsf(a->position[0] - b->position[0]) > eps) return true;
-  if (fabsf(a->position[1] - b->position[1]) > eps) return true;
-  if (fabsf(a->scale[0]    - b->scale[0])    > eps) return true;
-  if (fabsf(a->scale[1]    - b->scale[1])    > eps) return true;
-  if (fabsf(a->rotation.c  - b->rotation.c)  > eps) return true;
-  if (fabsf(a->rotation.s  - b->rotation.s)  > eps) return true;
-  return false;
+  return fabsf(pa[0] - pb[0]) > eps
+      || fabsf(pa[1] - pb[1]) > eps
+      || fabsf(sa[0] - sb[0]) > eps
+      || fabsf(sa[1] - sb[1]) > eps
+      || fabsf(ra.c - rb.c)   > eps
+      || fabsf(ra.s - rb.s)   > eps;
+}
+
+static SPATIAL_INLINE
+void
+spatial__pose2_slots_to_mat3(const vec2 p, spatial_rot2_t r, const vec2 s, mat3 out) {
+  out[0][0] =  r.c * s[0]; out[0][1] =  r.s * s[0]; out[0][2] = 0.0f;
+  out[1][0] = -r.s * s[1]; out[1][1] =  r.c * s[1]; out[1][2] = 0.0f;
+  out[2][0] =  p[0];       out[2][1] =  p[1];       out[2][2] = 1.0f;
 }
 
 static
 void
-spatial__traverse2(spatial_space2_t *space,
-                   spatial_node_t    handle,
-                   bool              parent_changed) {
-  spatial_node_data2_t *n;
-  spatial_pose2_t       new_world;
-  bool                  changed;
+spatial__traverse_iter2(spatial_space2_t *space, spatial_node_t start) {
+  spatial__trav_t *stack;
+  uint32_t         sp = 0;
+  const uint32_t   dirty_mask = SPATIAL_NODE_DIRTY_LOCAL | SPATIAL_NODE_DIRTY_WORLD;
 
-  if (!spatial_node2_valid(space, handle)) return;
-  n = &space->nodes[handle.index];
+  if (!spatial_node2_valid(space, start)) return;
 
-  if (n->flags & SPATIAL_NODE_PHYSICS_OWNS) {
-    new_world = n->world;
-  } else if (spatial_node_is_null(n->parent)) {
-    new_world = n->local;
-  } else {
-    spatial_node_data2_t *p = &space->nodes[n->parent.index];
-    spatial_pose2_compose(&p->world, &n->local, &new_world);
-  }
+  spatial__ensure_trav_capacity2(space, space->capacity);
+  stack = (spatial__trav_t *)space->trav_stack;
+  stack[sp++] = (spatial__trav_t){ start, 0u };
 
-  changed = parent_changed
-         || (n->flags & (SPATIAL_NODE_DIRTY_LOCAL | SPATIAL_NODE_DIRTY_WORLD))
-         || spatial__pose2_differs(&new_world, &n->world);
+  while (sp > 0) {
+    spatial__trav_t e     = stack[--sp];
+    uint32_t        idx   = e.node.index;
+    uint32_t        flags = space->flags[idx];
+    bool            changed;
+    spatial_node_t  child;
 
-  if (changed) {
-    n->world = new_world;
-    spatial_pose2_to_mat3(&n->world, n->world_matrix);
-    n->version++;
-  }
+    if (SPATIAL_UNLIKELY(!(flags & SPATIAL_NODE_ALIVE))) continue;
 
-  n->flags &= ~(SPATIAL_NODE_DIRTY_LOCAL | SPATIAL_NODE_DIRTY_WORLD);
+    if (flags & SPATIAL_NODE_PHYSICS_OWNS) {
+      spatial__pose2_slots_to_mat3(space->world_positions[idx],
+                                   space->world_rotations[idx],
+                                   space->world_scales[idx],
+                                   space->world_matrices[idx]);
+      space->versions[idx]++;
+      changed = true;
+    } else {
+      vec2           new_p, new_s, scaled, rotated;
+      spatial_rot2_t new_r;
+      spatial_node_t parent = space->parents[idx];
 
-  {
-    spatial_node_t child = n->first_child;
+      if (spatial_node_is_null(parent)) {
+        new_p[0] = space->local_positions[idx][0];
+        new_p[1] = space->local_positions[idx][1];
+        new_r    = space->local_rotations[idx];
+        new_s[0] = space->local_scales[idx][0];
+        new_s[1] = space->local_scales[idx][1];
+      } else {
+        uint32_t p = parent.index;
+        scaled[0] = space->world_scales[p][0] * space->local_positions[idx][0];
+        scaled[1] = space->world_scales[p][1] * space->local_positions[idx][1];
+        spatial_rot2_rotatev(space->world_rotations[p], scaled, rotated);
+        new_p[0] = space->world_positions[p][0] + rotated[0];
+        new_p[1] = space->world_positions[p][1] + rotated[1];
+        spatial_rot2_mul(space->world_rotations[p], space->local_rotations[idx], &new_r);
+        new_s[0] = space->world_scales[p][0] * space->local_scales[idx][0];
+        new_s[1] = space->world_scales[p][1] * space->local_scales[idx][1];
+      }
+
+      changed = e.parent_changed
+             || (flags & dirty_mask)
+             || spatial__pose2_slots_differ(space->world_positions[idx],
+                                            space->world_rotations[idx],
+                                            space->world_scales[idx],
+                                            new_p, new_r, new_s);
+
+      if (changed) {
+        space->world_positions[idx][0] = new_p[0];
+        space->world_positions[idx][1] = new_p[1];
+        space->world_rotations[idx]    = new_r;
+        space->world_scales[idx][0]    = new_s[0];
+        space->world_scales[idx][1]    = new_s[1];
+        spatial__pose2_slots_to_mat3(new_p, new_r, new_s, space->world_matrices[idx]);
+        space->versions[idx]++;
+      }
+    }
+
+    space->flags[idx] = flags & ~dirty_mask;
+
+    child = space->first_children[idx];
     while (!spatial_node_is_null(child)) {
-      spatial_node_data2_t *cd;
-      spatial_node_t next;
-      if (!spatial_node2_valid(space, child)) break;
-      cd   = &space->nodes[child.index];
-      next = cd->next_sibling;
-      spatial__traverse2(space, child, changed);
-      child = next;
+      if (SPATIAL_UNLIKELY(sp >= space->trav_capacity)) {
+        spatial__ensure_trav_capacity2(space, space->trav_capacity * 2);
+        stack = (spatial__trav_t *)space->trav_stack;
+      }
+      stack[sp++] = (spatial__trav_t){ child, changed ? 1u : 0u };
+      child = space->next_siblings[child.index];
     }
   }
 }
 
 SPATIAL_EXPORT
 void
-spatial_update2(spatial_space2_t * __restrict space) {
+spatial_update2(spatial_space2_t *space) {
   uint32_t i;
   if (!space) return;
 
   for (i = 0; i < space->dirty_count; i++) {
-    spatial__traverse2(space, space->dirty_roots[i], false);
+    spatial__traverse_iter2(space, space->dirty_roots[i]);
   }
 
   space->dirty_count = 0;

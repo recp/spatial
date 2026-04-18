@@ -35,6 +35,14 @@
 #  define SPATIAL_ALIGN(X) __attribute((aligned(X)))
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#  define SPATIAL_LIKELY(x)   __builtin_expect(!!(x), 1)
+#  define SPATIAL_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#  define SPATIAL_LIKELY(x)   (x)
+#  define SPATIAL_UNLIKELY(x) (x)
+#endif
+
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>

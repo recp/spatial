@@ -16,123 +16,163 @@
 #include "node.h"
 
 /*
- * Runtime context for the spatial system.
- * See DESIGN.md "Evolution of spatial_space_t" and spec/update.md.
+ * Data-oriented spatial runtime.
+ *
+ * Storage is Struct-of-Arrays: every field lives in its own contiguous
+ * array indexed by node slot. Physics and graphics hot loops iterate
+ * these arrays directly for maximum cache efficiency.
+ *
+ * Fields are grouped by access pattern (hot path vs cold path):
+ *   hot :  parents, flags, versions, world_positions, world_rotations
+ *   warm:  local_*, world_scales, first_children, next_siblings
+ *   cold:  world_matrices (derived), users, matrix_overrides
+ *
+ * All arrays grow together when capacity is exceeded. Handles remain
+ * stable; direct array pointers may be invalidated by creates.
  */
 
 typedef struct spatial_space_t {
-  spatial_node_data_t *nodes;
-  uint32_t         *generations;
-  uint32_t          capacity;
-  uint32_t          count;
-  uint32_t          free_head;
+  uint32_t         capacity;
+  uint32_t         count;
+  uint32_t         free_head;
+  spatial_node_t   root;
 
-  spatial_node_t       root;
+  uint32_t        *generations;
 
-  spatial_node_t      *dirty_roots;
-  uint32_t          dirty_count;
-  uint32_t          dirty_capacity;
+  /* hierarchy */
+  spatial_node_t  *parents;
+  spatial_node_t  *first_children;
+  spatial_node_t  *next_siblings;
 
-  uint64_t          update_version;
-  uint32_t          flags;
+  /* local pose SoA */
+  vec3            *local_positions;
+  versor          *local_rotations;
+  vec3            *local_scales;
+
+  /* world pose SoA */
+  vec3            *world_positions;
+  versor          *world_rotations;
+  vec3            *world_scales;
+
+  /* derived */
+  mat4            *world_matrices;
+
+  /* meta */
+  uint32_t        *flags;
+  uint32_t        *versions;
+  void           **users;
+  spatial_matrix_override_t **matrix_overrides;
+
+  /* dirty tracking */
+  spatial_node_t  *dirty_roots;
+  uint32_t         dirty_count;
+  uint32_t         dirty_capacity;
+
+  /* iterative traversal scratch (grown lazily) */
+  void            *trav_stack;
+  uint32_t         trav_capacity;
+
+  uint64_t         update_version;
+  uint32_t         space_flags;
 } spatial_space_t;
 
-/* Space lifecycle. */
+/* Lifecycle */
+SPATIAL_EXPORT spatial_space_t *spatial_space_create(uint32_t initial_capacity);
+SPATIAL_EXPORT void             spatial_space_destroy(spatial_space_t *space);
 
-SPATIAL_EXPORT
-spatial_space_t *
-spatial_space_create(uint32_t initial_capacity);
+/* Node lifecycle */
+SPATIAL_EXPORT spatial_node_t spatial_node_create(spatial_space_t      *space,
+                                                  spatial_node_t        parent,
+                                                  const spatial_pose_t *local);
+SPATIAL_EXPORT void           spatial_node_destroy(spatial_space_t *space,
+                                                   spatial_node_t   handle);
+SPATIAL_EXPORT bool           spatial_node_valid(const spatial_space_t *space,
+                                                 spatial_node_t         handle);
 
-SPATIAL_EXPORT
-void
-spatial_space_destroy(spatial_space_t * __restrict space);
+/* Pose accessors */
+SPATIAL_EXPORT void spatial_node_set_local(spatial_space_t      *space,
+                                           spatial_node_t        handle,
+                                           const spatial_pose_t *local);
+SPATIAL_EXPORT bool spatial_node_get_local(const spatial_space_t *space,
+                                           spatial_node_t         handle,
+                                           spatial_pose_t        *out);
+SPATIAL_EXPORT void spatial_node_set_world_physics(spatial_space_t      *space,
+                                                   spatial_node_t        handle,
+                                                   const spatial_pose_t *world);
+SPATIAL_EXPORT bool spatial_node_get_world(const spatial_space_t *space,
+                                           spatial_node_t         handle,
+                                           spatial_pose_t        *out);
+SPATIAL_EXPORT bool spatial_node_get_world_matrix(const spatial_space_t *space,
+                                                  spatial_node_t         handle,
+                                                  mat4                   out);
 
-/* Node lifecycle. */
+/* Meta accessors */
+SPATIAL_EXPORT uint32_t       spatial_node_get_flags(const spatial_space_t *space,
+                                                     spatial_node_t         handle);
+SPATIAL_EXPORT uint32_t       spatial_node_get_version(const spatial_space_t *space,
+                                                       spatial_node_t         handle);
+SPATIAL_EXPORT spatial_node_t spatial_node_get_parent(const spatial_space_t *space,
+                                                      spatial_node_t         handle);
+SPATIAL_EXPORT void           spatial_node_set_user(spatial_space_t *space,
+                                                    spatial_node_t   handle,
+                                                    void            *user);
+SPATIAL_EXPORT void          *spatial_node_get_user(const spatial_space_t *space,
+                                                    spatial_node_t         handle);
 
-SPATIAL_EXPORT
-spatial_node_t
-spatial_node_create(spatial_space_t      * __restrict space,
-                 spatial_node_t                    parent,
-                 const spatial_pose_t * __restrict local);
+/* Hierarchy */
+SPATIAL_EXPORT bool spatial_node_attach(spatial_space_t *space,
+                                        spatial_node_t   child,
+                                        spatial_node_t   new_parent);
 
-SPATIAL_EXPORT
-void
-spatial_node_destroy(spatial_space_t * __restrict space, spatial_node_t handle);
+/* Matrix override */
+SPATIAL_EXPORT void spatial_node_set_matrix(spatial_space_t *space,
+                                            spatial_node_t   handle,
+                                            const mat4       local);
+SPATIAL_EXPORT void spatial_node_clear_matrix(spatial_space_t *space,
+                                              spatial_node_t   handle);
 
-SPATIAL_EXPORT
-bool
-spatial_node_valid(const spatial_space_t * __restrict space, spatial_node_t handle);
-
-/* Access. */
-
-SPATIAL_EXPORT
-spatial_node_data_t *
-spatial_node_get(spatial_space_t * __restrict space, spatial_node_t handle);
-
-SPATIAL_EXPORT
-void
-spatial_node_set_local(spatial_space_t      * __restrict space,
-                    spatial_node_t                    handle,
-                    const spatial_pose_t * __restrict local);
-
-SPATIAL_EXPORT
-void
-spatial_node_set_world_physics(spatial_space_t      * __restrict space,
-                            spatial_node_t                    handle,
-                            const spatial_pose_t * __restrict world);
-
-SPATIAL_EXPORT
-bool
-spatial_node_get_world(const spatial_space_t * __restrict space,
-                    spatial_node_t                    handle,
-                    spatial_pose_t        * __restrict out);
-
-/* Hierarchy edits. */
-
-SPATIAL_EXPORT
-bool
-spatial_node_attach(spatial_space_t * __restrict space,
-                 spatial_node_t                child,
-                 spatial_node_t                new_parent);
-
-/* Matrix override (for skew / non-affine / graphics-only). */
-
-SPATIAL_EXPORT
-void
-spatial_node_set_matrix(spatial_space_t * __restrict space,
-                        spatial_node_t                handle,
-                        const mat4                    local_matrix);
-
-SPATIAL_EXPORT
-void
-spatial_node_clear_matrix(spatial_space_t * __restrict space,
-                          spatial_node_t                handle);
-
-/* Update. */
-
-SPATIAL_EXPORT
-void
-spatial_update(spatial_space_t * __restrict space);
+/* Update */
+SPATIAL_EXPORT void spatial_update(spatial_space_t *space);
 
 /* ================================================================== */
-/* 2D API.                                                            */
+/* 2D API. Parallel to 3D, same SoA discipline.                       */
 /* ================================================================== */
 
 typedef struct spatial_space2_t {
-  spatial_node_data2_t *nodes;
-  uint32_t             *generations;
-  uint32_t              capacity;
-  uint32_t              count;
-  uint32_t              free_head;
+  uint32_t         capacity;
+  uint32_t         count;
+  uint32_t         free_head;
+  spatial_node_t   root;
 
-  spatial_node_t        root;
+  uint32_t        *generations;
 
-  spatial_node_t       *dirty_roots;
-  uint32_t              dirty_count;
-  uint32_t              dirty_capacity;
+  spatial_node_t  *parents;
+  spatial_node_t  *first_children;
+  spatial_node_t  *next_siblings;
 
-  uint64_t              update_version;
-  uint32_t              flags;
+  vec2            *local_positions;
+  spatial_rot2_t  *local_rotations;
+  vec2            *local_scales;
+
+  vec2            *world_positions;
+  spatial_rot2_t  *world_rotations;
+  vec2            *world_scales;
+
+  mat3            *world_matrices;
+
+  uint32_t        *flags;
+  uint32_t        *versions;
+  void           **users;
+
+  spatial_node_t  *dirty_roots;
+  uint32_t         dirty_count;
+  uint32_t         dirty_capacity;
+
+  void            *trav_stack;
+  uint32_t         trav_capacity;
+
+  uint64_t         update_version;
+  uint32_t         space_flags;
 } spatial_space2_t;
 
 #define SPATIAL_POSE2_IDENTITY ((spatial_pose2_t){                   \
@@ -144,41 +184,41 @@ typedef struct spatial_space2_t {
 SPATIAL_EXPORT spatial_space2_t *spatial_space2_create(uint32_t initial_capacity);
 SPATIAL_EXPORT void              spatial_space2_destroy(spatial_space2_t *space);
 
-SPATIAL_EXPORT spatial_node_t
-spatial_node2_create(spatial_space2_t       * __restrict space,
-                     spatial_node_t                       parent,
-                     const spatial_pose2_t  * __restrict  local);
+SPATIAL_EXPORT spatial_node_t spatial_node2_create(spatial_space2_t       *space,
+                                                   spatial_node_t          parent,
+                                                   const spatial_pose2_t  *local);
+SPATIAL_EXPORT void           spatial_node2_destroy(spatial_space2_t *space,
+                                                    spatial_node_t    handle);
+SPATIAL_EXPORT bool           spatial_node2_valid(const spatial_space2_t *space,
+                                                  spatial_node_t          handle);
 
-SPATIAL_EXPORT void
-spatial_node2_destroy(spatial_space2_t *space, spatial_node_t handle);
+SPATIAL_EXPORT void spatial_node2_set_local(spatial_space2_t       *space,
+                                            spatial_node_t          handle,
+                                            const spatial_pose2_t  *local);
+SPATIAL_EXPORT bool spatial_node2_get_local(const spatial_space2_t *space,
+                                            spatial_node_t          handle,
+                                            spatial_pose2_t        *out);
+SPATIAL_EXPORT void spatial_node2_set_world_physics(spatial_space2_t       *space,
+                                                    spatial_node_t          handle,
+                                                    const spatial_pose2_t  *world);
+SPATIAL_EXPORT bool spatial_node2_get_world(const spatial_space2_t *space,
+                                            spatial_node_t          handle,
+                                            spatial_pose2_t        *out);
+SPATIAL_EXPORT bool spatial_node2_get_world_matrix(const spatial_space2_t *space,
+                                                   spatial_node_t          handle,
+                                                   mat3                    out);
 
-SPATIAL_EXPORT bool
-spatial_node2_valid(const spatial_space2_t *space, spatial_node_t handle);
+SPATIAL_EXPORT uint32_t       spatial_node2_get_flags(const spatial_space2_t *space,
+                                                      spatial_node_t          handle);
+SPATIAL_EXPORT uint32_t       spatial_node2_get_version(const spatial_space2_t *space,
+                                                        spatial_node_t          handle);
+SPATIAL_EXPORT spatial_node_t spatial_node2_get_parent(const spatial_space2_t *space,
+                                                       spatial_node_t          handle);
 
-SPATIAL_EXPORT spatial_node_data2_t *
-spatial_node2_get(spatial_space2_t *space, spatial_node_t handle);
+SPATIAL_EXPORT bool spatial_node2_attach(spatial_space2_t *space,
+                                         spatial_node_t    child,
+                                         spatial_node_t    new_parent);
 
-SPATIAL_EXPORT void
-spatial_node2_set_local(spatial_space2_t       * __restrict space,
-                        spatial_node_t                       handle,
-                        const spatial_pose2_t  * __restrict  local);
-
-SPATIAL_EXPORT void
-spatial_node2_set_world_physics(spatial_space2_t       * __restrict space,
-                                spatial_node_t                       handle,
-                                const spatial_pose2_t  * __restrict  world);
-
-SPATIAL_EXPORT bool
-spatial_node2_get_world(const spatial_space2_t *space,
-                        spatial_node_t         handle,
-                        spatial_pose2_t       *out);
-
-SPATIAL_EXPORT bool
-spatial_node2_attach(spatial_space2_t *space,
-                     spatial_node_t    child,
-                     spatial_node_t    new_parent);
-
-SPATIAL_EXPORT void
-spatial_update2(spatial_space2_t * __restrict space);
+SPATIAL_EXPORT void spatial_update2(spatial_space2_t *space);
 
 #endif /* spatial_h */
