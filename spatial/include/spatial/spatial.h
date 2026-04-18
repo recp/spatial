@@ -44,15 +44,16 @@ typedef struct spatial_space_t {
   spatial_node_t  *first_children;
   spatial_node_t  *next_siblings;
 
-  /* local pose SoA */
-  vec3            *local_positions;
+  /* local pose SoA — vec4 storage for 16-byte alignment + SIMD.
+     xyz are the actual value; w = 1.0f (pass-through, unused semantically). */
+  vec4            *local_positions;
   versor          *local_rotations;
-  vec3            *local_scales;
+  vec4            *local_scales;
 
   /* world pose SoA */
-  vec3            *world_positions;
+  vec4            *world_positions;
   versor          *world_rotations;
-  vec3            *world_scales;
+  vec4            *world_scales;
 
   /* derived */
   mat4            *world_matrices;

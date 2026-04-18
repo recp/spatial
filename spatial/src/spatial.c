@@ -106,47 +106,64 @@ spatial_pose_compose(const spatial_pose_t * __restrict a,
   glm_vec3_copy(scl, out->scale);
 }
 
-/* Inline hot-path variant operating on raw SoA slots. */
+/* Inline hot-path SoA compose. Positions / scales are vec4 for SIMD
+   alignment; w lane carries through arithmetic (ignored semantically). */
 static SPATIAL_INLINE
 void
-spatial__compose_slots(const vec3 pa, const versor qa, const vec3 sa,
-                       const vec3 pb, const versor qb, const vec3 sb,
-                       vec3 po,       versor qo,       vec3 so) {
-  vec3 scaled, rotated;
-  glm_vec3_mul((float *)sa, (float *)pb, scaled);
+spatial__compose_slots(const vec4 pa, const versor qa, const vec4 sa,
+                       const vec4 pb, const versor qb, const vec4 sb,
+                       vec4 po,       versor qo,       vec4 so) {
+  vec4 scaled;
+  vec3 rotated;
+
+  /* scaled = a.scale * b.position — SIMD 4-lane */
+  glm_vec4_mul((float *)sa, (float *)pb, scaled);
+  /* rotate: glm_quat_rotatev writes first 3 floats */
   glm_quat_rotatev((float *)qa, scaled, rotated);
-  glm_vec3_add((float *)pa, rotated, po);
+  /* po = a.position + rotated  (scalar add on 3 lanes; w preserved from pa) */
+  po[0] = pa[0] + rotated[0];
+  po[1] = pa[1] + rotated[1];
+  po[2] = pa[2] + rotated[2];
+  po[3] = 0.0f;
+
   glm_quat_mul((float *)qa, (float *)qb, qo);
-  glm_vec3_mul((float *)sa, (float *)sb, so);
+
+  /* so = a.scale * b.scale — SIMD 4-lane */
+  glm_vec4_mul((float *)sa, (float *)sb, so);
 }
 
-/* Inline hot-path pose_to_mat4 operating on raw SoA slots. */
+/* Inline hot-path pose_to_mat4. SIMD broadcast-scale on mat4 columns. */
 static SPATIAL_INLINE
 void
-spatial__pose_slots_to_mat4(const vec3 p, const versor q, const vec3 s, mat4 out) {
+spatial__pose_slots_to_mat4(const vec4 p, const versor q, const vec4 s, mat4 out) {
   glm_quat_mat4((float *)q, out);
-  out[0][0] *= s[0]; out[0][1] *= s[0]; out[0][2] *= s[0];
-  out[1][0] *= s[1]; out[1][1] *= s[1]; out[1][2] *= s[1];
-  out[2][0] *= s[2]; out[2][1] *= s[2]; out[2][2] *= s[2];
-  out[3][0] = p[0]; out[3][1] = p[1]; out[3][2] = p[2];
+  /* Each column is a vec4 → broadcast scalar scale across 4 lanes. */
+  glm_vec4_scale(out[0], s[0], out[0]);
+  glm_vec4_scale(out[1], s[1], out[1]);
+  glm_vec4_scale(out[2], s[2], out[2]);
+  out[3][0] = p[0];
+  out[3][1] = p[1];
+  out[3][2] = p[2];
   out[3][3] = 1.0f;
 }
 
-/* SIMD-friendly pose diff using cglm vector ops. */
+/* SIMD pose diff. 4-lane subs for pos/scale/quat then squared-sum on
+   the semantically meaningful lanes. */
 static SPATIAL_INLINE
 bool
-spatial__pose_slots_differ(const vec3 pa, const versor qa, const vec3 sa,
-                           const vec3 pb, const versor qb, const vec3 sb) {
+spatial__pose_slots_differ(const vec4 pa, const versor qa, const vec4 sa,
+                           const vec4 pb, const versor qb, const vec4 sb) {
   const float eps2 = 1e-12f;
-  vec3   dp, ds;
+  vec4   dp, ds;
   versor dq;
 
-  glm_vec3_sub((float *)pa, (float *)pb, dp);
-  glm_vec3_sub((float *)sa, (float *)sb, ds);
+  glm_vec4_sub((float *)pa, (float *)pb, dp);
+  glm_vec4_sub((float *)sa, (float *)sb, ds);
   glm_vec4_sub((float *)qa, (float *)qb, dq);
 
-  return glm_vec3_norm2(dp) > eps2
-      || glm_vec3_norm2(ds) > eps2
+  /* position / scale: only xyz matter; quat: all 4 lanes */
+  return (dp[0] * dp[0] + dp[1] * dp[1] + dp[2] * dp[2]) > eps2
+      || (ds[0] * ds[0] + ds[1] * ds[1] + ds[2] * ds[2]) > eps2
       || glm_vec4_norm2(dq) > eps2;
 }
 
@@ -225,12 +242,12 @@ spatial__grow_arrays(spatial_space_t *space, uint32_t new_cap) {
   space->parents         = realloc(space->parents,         sizeof(spatial_node_t) * new_cap);
   space->first_children  = realloc(space->first_children,  sizeof(spatial_node_t) * new_cap);
   space->next_siblings   = realloc(space->next_siblings,   sizeof(spatial_node_t) * new_cap);
-  space->local_positions = realloc(space->local_positions, sizeof(vec3)           * new_cap);
+  space->local_positions = realloc(space->local_positions, sizeof(vec4)           * new_cap);
   space->local_rotations = realloc(space->local_rotations, sizeof(versor)         * new_cap);
-  space->local_scales    = realloc(space->local_scales,    sizeof(vec3)           * new_cap);
-  space->world_positions = realloc(space->world_positions, sizeof(vec3)           * new_cap);
+  space->local_scales    = realloc(space->local_scales,    sizeof(vec4)           * new_cap);
+  space->world_positions = realloc(space->world_positions, sizeof(vec4)           * new_cap);
   space->world_rotations = realloc(space->world_rotations, sizeof(versor)         * new_cap);
-  space->world_scales    = realloc(space->world_scales,    sizeof(vec3)           * new_cap);
+  space->world_scales    = realloc(space->world_scales,    sizeof(vec4)           * new_cap);
   space->world_matrices  = realloc(space->world_matrices,  sizeof(mat4)           * new_cap);
   space->flags           = realloc(space->flags,           sizeof(uint32_t)       * new_cap);
   space->versions        = realloc(space->versions,        sizeof(uint32_t)       * new_cap);
@@ -331,12 +348,12 @@ spatial_space_create(uint32_t initial_capacity) {
   space->parents[slot]         = SPATIAL_NODE_NULL;
   space->first_children[slot]  = SPATIAL_NODE_NULL;
   space->next_siblings[slot]   = SPATIAL_NODE_NULL;
-  glm_vec3_zero(space->local_positions[slot]);
+  glm_vec4_zero(space->local_positions[slot]);
   glm_quat_identity(space->local_rotations[slot]);
-  glm_vec3_one(space->local_scales[slot]);
-  glm_vec3_zero(space->world_positions[slot]);
+  glm_vec4_one(space->local_scales[slot]);
+  glm_vec4_zero(space->world_positions[slot]);
   glm_quat_identity(space->world_rotations[slot]);
-  glm_vec3_one(space->world_scales[slot]);
+  glm_vec4_one(space->world_scales[slot]);
   glm_mat4_identity(space->world_matrices[slot]);
   space->flags[slot]    = SPATIAL_NODE_ALIVE;
   space->versions[slot] = 1;
@@ -408,16 +425,18 @@ spatial_node_create(spatial_space_t      * __restrict space,
 
   if (local) {
     glm_vec3_copy((float *)local->position, space->local_positions[slot]);
+    space->local_positions[slot][3] = 0.0f;
     glm_quat_copy((float *)local->rotation, space->local_rotations[slot]);
     glm_vec3_copy((float *)local->scale,    space->local_scales[slot]);
+    space->local_scales[slot][3] = 0.0f;
   } else {
-    glm_vec3_zero(space->local_positions[slot]);
+    glm_vec4_zero(space->local_positions[slot]);
     glm_quat_identity(space->local_rotations[slot]);
-    glm_vec3_one(space->local_scales[slot]);
+    glm_vec4_one(space->local_scales[slot]);
   }
-  glm_vec3_zero(space->world_positions[slot]);
+  glm_vec4_zero(space->world_positions[slot]);
   glm_quat_identity(space->world_rotations[slot]);
-  glm_vec3_one(space->world_scales[slot]);
+  glm_vec4_one(space->world_scales[slot]);
   glm_mat4_identity(space->world_matrices[slot]);
   space->flags[slot]            = SPATIAL_NODE_ALIVE | SPATIAL_NODE_DIRTY_LOCAL;
   space->versions[slot]         = 1;
@@ -536,8 +555,10 @@ spatial_node_set_local(spatial_space_t      * __restrict space,
                        const spatial_pose_t * __restrict local) {
   if (!spatial_node_valid(space, handle) || !local) return;
   glm_vec3_copy((float *)local->position, space->local_positions[handle.index]);
+  space->local_positions[handle.index][3] = 0.0f;
   glm_quat_copy((float *)local->rotation, space->local_rotations[handle.index]);
   glm_vec3_copy((float *)local->scale,    space->local_scales[handle.index]);
+  space->local_scales[handle.index][3]    = 0.0f;
   space->flags[handle.index] |= SPATIAL_NODE_DIRTY_LOCAL;
   spatial__push_dirty(space, handle);
 }
@@ -561,8 +582,10 @@ spatial_node_set_world_physics(spatial_space_t      * __restrict space,
                                const spatial_pose_t * __restrict world) {
   if (!spatial_node_valid(space, handle) || !world) return;
   glm_vec3_copy((float *)world->position, space->world_positions[handle.index]);
+  space->world_positions[handle.index][3] = 0.0f;
   glm_quat_copy((float *)world->rotation, space->world_rotations[handle.index]);
   glm_vec3_copy((float *)world->scale,    space->world_scales[handle.index]);
+  space->world_scales[handle.index][3]    = 0.0f;
   space->flags[handle.index] |= SPATIAL_NODE_DIRTY_WORLD | SPATIAL_NODE_PHYSICS_OWNS;
   spatial__push_dirty(space, handle);
 }
@@ -640,8 +663,10 @@ spatial_node_set_matrix(spatial_space_t * __restrict space,
   /* best-effort pose decomposition for readers that ignore matrix path */
   spatial_mat4_to_pose(local, &pose);
   glm_vec3_copy(pose.position, space->local_positions[handle.index]);
+  space->local_positions[handle.index][3] = 0.0f;
   glm_quat_copy(pose.rotation, space->local_rotations[handle.index]);
   glm_vec3_copy(pose.scale,    space->local_scales[handle.index]);
+  space->local_scales[handle.index][3]    = 0.0f;
 
   space->flags[handle.index] |= SPATIAL_NODE_HAS_MATRIX | SPATIAL_NODE_DIRTY_LOCAL;
   spatial__push_dirty(space, handle);
@@ -701,8 +726,10 @@ spatial__traverse_iter(spatial_space_t *space, spatial_node_t start) {
         spatial_pose_t wp;
         spatial_mat4_to_pose(space->world_matrices[idx], &wp);
         glm_vec3_copy(wp.position, space->world_positions[idx]);
+        space->world_positions[idx][3] = 0.0f;
         glm_quat_copy(wp.rotation, space->world_rotations[idx]);
         glm_vec3_copy(wp.scale,    space->world_scales[idx]);
+        space->world_scales[idx][3]    = 0.0f;
       }
       space->versions[idx]++;
       changed = true;
@@ -715,14 +742,14 @@ spatial__traverse_iter(spatial_space_t *space, spatial_node_t start) {
       space->versions[idx]++;
       changed = true;
     } else {
-      vec3   new_p, new_s;
+      vec4   new_p, new_s;
       versor new_q;
       spatial_node_t parent = space->parents[idx];
 
       if (spatial_node_is_null(parent)) {
-        glm_vec3_copy(space->local_positions[idx], new_p);
+        glm_vec4_copy(space->local_positions[idx], new_p);
         glm_quat_copy(space->local_rotations[idx], new_q);
-        glm_vec3_copy(space->local_scales[idx],    new_s);
+        glm_vec4_copy(space->local_scales[idx],    new_s);
       } else {
         spatial__compose_slots(space->world_positions[parent.index],
                                space->world_rotations[parent.index],
@@ -741,9 +768,9 @@ spatial__traverse_iter(spatial_space_t *space, spatial_node_t start) {
                                            new_p, new_q, new_s);
 
       if (changed) {
-        glm_vec3_copy(new_p, space->world_positions[idx]);
+        glm_vec4_copy(new_p, space->world_positions[idx]);
         glm_quat_copy(new_q, space->world_rotations[idx]);
-        glm_vec3_copy(new_s, space->world_scales[idx]);
+        glm_vec4_copy(new_s, space->world_scales[idx]);
         spatial__pose_slots_to_mat4(new_p, new_q, new_s, space->world_matrices[idx]);
         space->versions[idx]++;
       }
