@@ -417,6 +417,34 @@ spatial_space_reserve(spatial_space_t *space, uint32_t capacity) {
 
 SPATIAL_EXPORT
 void
+spatial_space_reserve_dirty(spatial_space_t *space, uint32_t n) {
+  if (!space) return;
+  if (n > space->dirty_capacity) {
+    space->dirty_roots    = realloc(space->dirty_roots, sizeof(spatial_node_t) * n);
+    SPATIAL_OOM_CHECK(space->dirty_roots);
+    space->dirty_capacity = n;
+  }
+}
+
+SPATIAL_EXPORT
+void
+spatial_node_mark_dirty_mt(spatial_space_t *space,
+                           spatial_node_t   handle,
+                           uint32_t         dirty_flag) {
+  uint32_t slot;
+  /* Atomically OR the dirty flag. Always append to dirty_roots — the
+   * compaction pass in spatial_update handles duplicates and ancestor
+   * coverage that this path can't cheaply check under MT races. */
+  SPATIAL_ATOMIC_FETCH_OR_U32(&space->flags[handle.index], dirty_flag);
+
+  slot = SPATIAL_ATOMIC_FETCH_ADD_U32(&space->dirty_count, 1u);
+  /* Caller must reserve capacity via spatial_space_reserve_dirty. */
+  if (SPATIAL_UNLIKELY(slot >= space->dirty_capacity)) abort();
+  space->dirty_roots[slot] = handle;
+}
+
+SPATIAL_EXPORT
+void
 spatial_space_destroy(spatial_space_t *space) {
   uint32_t i;
 

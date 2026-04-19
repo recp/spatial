@@ -263,6 +263,68 @@ TEST(reserve_keeps_pointers_stable) {
   spatial_space_destroy(s);
 }
 
+#include <pthread.h>
+
+typedef struct mt_writer_arg_t {
+  spatial_space_t *s;
+  spatial_node_t  *handles;
+  uint32_t         start;
+  uint32_t         end;
+  uint32_t         k;
+} mt_writer_arg_t;
+
+static void *mt_writer_main(void *arg) {
+  mt_writer_arg_t *a = (mt_writer_arg_t *)arg;
+  uint32_t         i;
+  for (i = a->start; i < a->end; i++) {
+    uint32_t idx = a->handles[i].index;
+    a->s->world_positions[idx][0] = (float)(i + a->k);
+    a->s->flags[idx] |= SPATIAL_NODE_PHYSICS_OWNS;
+    spatial_node_mark_dirty_mt(a->s, a->handles[i], SPATIAL_NODE_DIRTY_WORLD);
+  }
+  return NULL;
+}
+
+TEST(mt_writer_disjoint) {
+  /* Simulate physics jobs: N threads write disjoint body ranges in
+   * parallel via spatial_node_mark_dirty_mt, then spatial_update. */
+  spatial_space_t *s = spatial_space_create(16);
+  const uint32_t   n = 400;
+  spatial_node_t   handles[400];
+  pthread_t        threads[4];
+  mt_writer_arg_t  args[4];
+  uint32_t         i;
+  int              t;
+
+  spatial_space_reserve(s, n + 16);
+  spatial_space_reserve_dirty(s, n + 16);
+
+  for (i = 0; i < n; i++) {
+    handles[i] = spatial_node_create(s, SPATIAL_NODE_NULL, NULL);
+  }
+  spatial_update(s);
+
+  for (t = 0; t < 4; t++) {
+    args[t].s       = s;
+    args[t].handles = handles;
+    args[t].start   = t * (n / 4);
+    args[t].end     = (t + 1) * (n / 4);
+    args[t].k       = 100u;
+    pthread_create(&threads[t], NULL, mt_writer_main, &args[t]);
+  }
+  for (t = 0; t < 4; t++) pthread_join(threads[t], NULL);
+
+  spatial_update(s);
+
+  for (i = 0; i < n; i++) {
+    spatial_pose_t w;
+    spatial_node_get_world(s, handles[i], &w);
+    CHECK_FLOAT(w.position[0], (float)(i + 100));
+  }
+
+  spatial_space_destroy(s);
+}
+
 TEST(parallel_update) {
   /* Build many disjoint dirty-root subtrees and verify parallel dispatch
    * produces the same world poses as sequential. */
@@ -434,6 +496,7 @@ int main(void) {
   RUN(zero_copy_accessors);
   RUN(soa_direct_access);
   RUN(reserve_keeps_pointers_stable);
+  RUN(mt_writer_disjoint);
   RUN(parallel_update);
   RUN(basic_hierarchy_2d);
   RUN(rotation_2d);

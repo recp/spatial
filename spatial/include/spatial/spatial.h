@@ -94,6 +94,22 @@ SPATIAL_EXPORT void             spatial_space_destroy(spatial_space_t *space);
 SPATIAL_EXPORT void spatial_space_reserve(spatial_space_t *space,
                                           uint32_t         capacity);
 
+/* Pre-allocate the dirty-roots ring to `n` entries. Required before any
+   thread-safe mark_dirty_mt calls so the atomic append never grows the
+   array concurrently. No-op if already sized. */
+SPATIAL_EXPORT void spatial_space_reserve_dirty(spatial_space_t *space,
+                                                uint32_t         n);
+
+/* Thread-safe dirty mark — intended for Phase 2 parallel writers that
+   update disjoint nodes (e.g., physics solver jobs). Atomically ORs the
+   dirty flag and appends the handle to the dirty-roots ring. The post-
+   update compaction pass deduplicates entries so callers do not need to
+   check whether they raced. dirty_roots capacity MUST cover worst-case
+   concurrent pushes; use spatial_space_reserve_dirty(). */
+SPATIAL_EXPORT void spatial_node_mark_dirty_mt(spatial_space_t *space,
+                                               spatial_node_t   handle,
+                                               uint32_t         dirty_flag);
+
 /* Node lifecycle */
 SPATIAL_EXPORT spatial_node_t spatial_node_create(spatial_space_t      *space,
                                                   spatial_node_t        parent,

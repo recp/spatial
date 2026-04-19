@@ -38,9 +38,18 @@
 #if defined(__GNUC__) || defined(__clang__)
 #  define SPATIAL_LIKELY(x)   __builtin_expect(!!(x), 1)
 #  define SPATIAL_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#  define SPATIAL_ATOMIC_FETCH_ADD_U32(p, v) __atomic_fetch_add((p), (v), __ATOMIC_ACQ_REL)
+#  define SPATIAL_ATOMIC_FETCH_OR_U32(p, v)  __atomic_fetch_or((p),  (v), __ATOMIC_ACQ_REL)
+#elif defined(_MSC_VER)
+#  include <intrin.h>
+#  define SPATIAL_LIKELY(x)   (x)
+#  define SPATIAL_UNLIKELY(x) (x)
+#  define SPATIAL_ATOMIC_FETCH_ADD_U32(p, v) ((uint32_t)_InterlockedExchangeAdd((volatile long*)(p), (long)(v)))
+#  define SPATIAL_ATOMIC_FETCH_OR_U32(p, v)  ((uint32_t)_InterlockedOr((volatile long*)(p),         (long)(v)))
 #else
 #  define SPATIAL_LIKELY(x)   (x)
 #  define SPATIAL_UNLIKELY(x) (x)
+#  error "no atomics support for this compiler"
 #endif
 
 #include <stdlib.h>
