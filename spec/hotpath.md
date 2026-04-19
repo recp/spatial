@@ -137,6 +137,10 @@ to prevent `realloc`. Never cache across node destroys. This pattern
 lets spatial underlie a physics solver with effectively zero overhead
 versus a dedicated physics transform store.
 
+For multi-threaded writers (physics / animation job systems), see
+[parallel.md](parallel.md) and `spatial_node_mark_dirty_mt` —
+lock-free per-node dirty push backed by atomic fetch-or / fetch-add.
+
 ## Zero-copy reads for graphics
 
 For render loops, command recording, and culling jobs, use the
