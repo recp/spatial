@@ -132,10 +132,19 @@ bench_physics_hotpath(uint32_t n, int iters) {
 int main(void) {
   printf("spatial benchmarks\n");
 
-  printf("\n[flat hierarchy]\n");
-  bench_flat(1000,  1000, false);
-  bench_flat(10000, 200,  false);
-  bench_flat(10000, 200,  true);
+  printf("\n[flat hierarchy — sequential vs parallel crossover]\n");
+  bench_flat(10,    10000, false);
+  bench_flat(10,    10000, true);
+  bench_flat(50,    10000, false);
+  bench_flat(50,    10000, true);
+  bench_flat(100,   10000, false);
+  bench_flat(100,   10000, true);
+  bench_flat(500,   1000,  false);
+  bench_flat(500,   1000,  true);
+  bench_flat(1000,  1000,  false);
+  bench_flat(1000,  1000,  true);
+  bench_flat(10000, 200,   false);
+  bench_flat(10000, 200,   true);
 
   printf("\n[deep chain]\n");
   bench_deep(100,  10000);

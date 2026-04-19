@@ -76,6 +76,7 @@ typedef struct spatial_space_t {
   /* Thread pool for parallel dirty-root traversal.
      NULL unless spatial_space_enable_parallel() was called. */
   void            *pool;
+  uint32_t         parallel_threshold;
 
   uint64_t         update_version;
   uint32_t         space_flags;
@@ -152,6 +153,14 @@ SPATIAL_EXPORT void spatial_update(spatial_space_t *space);
    Sequential updates still work after enabling (single dirty root, etc.). */
 SPATIAL_EXPORT void spatial_space_enable_parallel(spatial_space_t *space,
                                                   uint32_t         thread_count);
+
+/* Set the minimum dirty_count below which spatial_update falls back to
+   sequential even when the pool is enabled. Default is tuned for
+   shallow hierarchies; physics-heavy scenes with deep subtrees may
+   benefit from lower values. Setting 0 disables the threshold (always
+   parallel when pool exists and dirty_count >= 2). */
+SPATIAL_EXPORT void spatial_space_set_parallel_threshold(spatial_space_t *space,
+                                                         uint32_t         min_dirty_roots);
 
 /* ================================================================== */
 /* 2D API. Parallel to 3D, same SoA discipline.                       */

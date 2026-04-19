@@ -853,8 +853,12 @@ spatial__traverse_iter(spatial_space_t      *space,
 /* ancestor dedupe), so threads can traverse them independently.    */
 /* ============================================================== */
 
-#define SPATIAL_PARALLEL_THRESHOLD 8   /* below this, dispatch overhead outweighs */
-#define SPATIAL_WORK_CHUNK          8   /* grab N roots per mutex lock */
+/* Default crossover based on flat-hierarchy benchmarks (see bench/).
+ * Single-node subtrees amortize dispatch overhead only beyond ~200–500;
+ * 128 is a conservative middle where mixed workloads still win. Users
+ * can override via spatial_space_set_parallel_threshold(). */
+#define SPATIAL_PARALLEL_THRESHOLD_DEFAULT 128
+#define SPATIAL_WORK_CHUNK                   8
 
 typedef struct spatial__worker_t {
   spatial_thread_t       *thread;
@@ -987,7 +991,15 @@ spatial_space_enable_parallel(spatial_space_t *space, uint32_t thread_count) {
     thread_count = spatial_thread_hw_concurrency();
     if (thread_count < 2) thread_count = 2;
   }
-  space->pool = spatial__pool_create(space, thread_count);
+  space->pool               = spatial__pool_create(space, thread_count);
+  space->parallel_threshold = SPATIAL_PARALLEL_THRESHOLD_DEFAULT;
+}
+
+SPATIAL_EXPORT
+void
+spatial_space_set_parallel_threshold(spatial_space_t *space, uint32_t min_dirty_roots) {
+  if (!space) return;
+  space->parallel_threshold = min_dirty_roots < 2 ? 2 : min_dirty_roots;
 }
 
 /* Compact dirty_roots by dropping entries whose ancestor is also dirty.
@@ -1041,7 +1053,7 @@ spatial_update(spatial_space_t * __restrict space) {
   }
 
 #if SPATIAL_HAS_THREADS
-  if (space->pool && space->dirty_count >= SPATIAL_PARALLEL_THRESHOLD) {
+  if (space->pool && space->dirty_count >= space->parallel_threshold) {
     spatial__pool_dispatch((spatial__pool_t *)space->pool, space->dirty_count);
     space->dirty_count = 0;
     space->update_version++;
