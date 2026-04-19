@@ -154,12 +154,22 @@ SPATIAL_EXPORT bool spatial_node_attach(spatial_space_t *space,
                                         spatial_node_t   child,
                                         spatial_node_t   new_parent);
 
-/* Matrix override */
+/* Matrix override. Applied only on the node it is set on — does not
+   propagate shear/non-affine detail through to descendants, which
+   continue to compose from the decomposed pose. Intended for leaf or
+   near-leaf graphics/editor nodes (look-at, skew, CSS-style stacks). */
 SPATIAL_EXPORT void spatial_node_set_matrix(spatial_space_t *space,
                                             spatial_node_t   handle,
                                             const mat4       local);
 SPATIAL_EXPORT void spatial_node_clear_matrix(spatial_space_t *space,
                                               spatial_node_t   handle);
+
+/* Authority transfer. Sets or clears SPATIAL_NODE_PHYSICS_OWNS without
+   forcing callers to poke SoA flags directly. Clearing ownership marks
+   the node dirty so the next update propagates the transition. */
+SPATIAL_EXPORT void spatial_node_set_physics_authority(spatial_space_t *space,
+                                                       spatial_node_t   handle,
+                                                       bool             owns);
 
 /* ================================================================== */
 /* Zero-copy live accessors.                                          */

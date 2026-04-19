@@ -263,8 +263,18 @@ TEST(reserve_keeps_pointers_stable) {
   spatial_space_destroy(s);
 }
 
+/* Multi-threaded writer test uses pthread directly. Skipped on
+ * platforms without pthread (Windows). The same pattern is available
+ * via the internal spatial_thread_* abstraction; the test deliberately
+ * avoids that so it stays runnable without exposing internal headers. */
+#ifndef _WIN32
 #include <pthread.h>
+#define SPATIAL_TEST_HAS_PTHREAD 1
+#else
+#define SPATIAL_TEST_HAS_PTHREAD 0
+#endif
 
+#if SPATIAL_TEST_HAS_PTHREAD
 typedef struct mt_writer_arg_t {
   spatial_space_t *s;
   spatial_node_t  *handles;
@@ -324,6 +334,7 @@ TEST(mt_writer_disjoint) {
 
   spatial_space_destroy(s);
 }
+#endif /* SPATIAL_TEST_HAS_PTHREAD */
 
 TEST(parallel_update) {
   /* Build many disjoint dirty-root subtrees and verify parallel dispatch
@@ -370,6 +381,75 @@ TEST(parallel_update) {
   }
 
   spatial_space_destroy(s);
+}
+
+TEST(authority_transfer) {
+  spatial_space_t *s = spatial_space_create(8);
+  spatial_pose_t   p = SPATIAL_POSE_IDENTITY;
+  spatial_pose_t   w = SPATIAL_POSE_IDENTITY;
+  spatial_pose_t   out;
+  spatial_node_t   a;
+
+  /* Phase 1: local-authored. */
+  p.position[0] = 1.0f;
+  a = spatial_node_create(s, SPATIAL_NODE_NULL, &p);
+  spatial_update(s);
+  spatial_node_get_world(s, a, &out);
+  CHECK_FLOAT(out.position[0], 1.0f);
+
+  /* Phase 2: physics takes ownership, writes world. */
+  spatial_node_set_physics_authority(s, a, true);
+  CHECK(spatial_node_get_flags(s, a) & SPATIAL_NODE_PHYSICS_OWNS);
+  w.position[0] = 99.0f;
+  spatial_node_set_world_physics(s, a, &w);
+  spatial_update(s);
+  spatial_node_get_world(s, a, &out);
+  CHECK_FLOAT(out.position[0], 99.0f);
+
+  /* Phase 3: hand authority back to local. Local should drive world. */
+  spatial_node_set_physics_authority(s, a, false);
+  CHECK(!(spatial_node_get_flags(s, a) & SPATIAL_NODE_PHYSICS_OWNS));
+  p.position[0] = 7.0f;
+  spatial_node_set_local(s, a, &p);
+  spatial_update(s);
+  spatial_node_get_world(s, a, &out);
+  CHECK_FLOAT(out.position[0], 7.0f);
+
+  spatial_space_destroy(s);
+}
+
+TEST(mt_dedupe_same_node) {
+  /* Calling mark_dirty_mt on the same node multiple times MUST land
+   * exactly one entry in dirty_roots. */
+  spatial_space_t *s = spatial_space_create(8);
+  spatial_node_t   a;
+
+  spatial_space_reserve_dirty(s, 32);
+  a = spatial_node_create(s, SPATIAL_NODE_NULL, NULL);
+  spatial_update(s);  /* clear initial dirty */
+
+  spatial_node_mark_dirty_mt(s, a, SPATIAL_NODE_DIRTY_WORLD);
+  spatial_node_mark_dirty_mt(s, a, SPATIAL_NODE_DIRTY_WORLD);
+  spatial_node_mark_dirty_mt(s, a, SPATIAL_NODE_DIRTY_WORLD);
+
+  CHECK(s->dirty_count == 1);
+  CHECK(spatial_node_eq(s->dirty_roots[0], a));
+
+  spatial_space_destroy(s);
+}
+
+TEST(mat4_to_transform_conversion) {
+  mat4                 m;
+  spatial_transform_t  t;
+
+  glm_mat4_identity(m);
+  m[3][0] = 10.0f; m[3][1] = 20.0f; m[3][2] = 30.0f;
+
+  spatial_mat4_to_transform(m, &t);
+  CHECK_FLOAT(t.position[0], 10.0f);
+  CHECK_FLOAT(t.position[1], 20.0f);
+  CHECK_FLOAT(t.position[2], 30.0f);
+  CHECK_FLOAT(t.rotation[3], 1.0f);  /* identity quat w */
 }
 
 TEST(zero_copy_accessors) {
@@ -493,10 +573,15 @@ int main(void) {
   RUN(update_version_bumps);
   RUN(node_version_bumps_on_change);
   RUN(dirty_dedupe);
+  RUN(authority_transfer);
+  RUN(mt_dedupe_same_node);
+  RUN(mat4_to_transform_conversion);
   RUN(zero_copy_accessors);
   RUN(soa_direct_access);
   RUN(reserve_keeps_pointers_stable);
+#if SPATIAL_TEST_HAS_PTHREAD
   RUN(mt_writer_disjoint);
+#endif
   RUN(parallel_update);
   RUN(basic_hierarchy_2d);
   RUN(rotation_2d);

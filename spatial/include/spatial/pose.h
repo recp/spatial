@@ -83,6 +83,10 @@ SPATIAL_EXPORT
 void
 spatial_mat4_to_pose(const mat4 m, spatial_pose_t * __restrict out);
 
+SPATIAL_EXPORT
+void
+spatial_mat4_to_transform(const mat4 m, spatial_transform_t * __restrict out);
+
 /* Composition: out = a ∘ b  (apply b in a's frame). */
 
 SPATIAL_EXPORT

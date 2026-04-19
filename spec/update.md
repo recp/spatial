@@ -53,10 +53,13 @@ subtree).
 traverse(node):
   data = space->nodes[node.index]
 
-  if data.flags & HAS_EXPR:
-    evaluate expression chain → data.local
+  /* HAS_EXPR (optional expression-chain evaluation) is reserved for a
+     future spatial-expr upper layer; the reference implementation does
+     not evaluate expressions during update. */
   if data.flags & HAS_MATRIX:
-    data.world_matrix = matrix override
+    data.world_matrix = parent.world_matrix * matrix_override  (or override itself at root)
+    /* Matrix override is applied on this node only; descendants compose
+       from the decomposed pose. Treat as leaf-or-near-leaf. */
     goto children
 
   if data.flags & PHYSICS_OWNS:
@@ -134,10 +137,13 @@ for deterministic builds.
 - Implementations **MAY** parallelize traversal across independent
   dirty roots. See [parallel.md](parallel.md) for the dispatch model,
   worker contract, and threshold semantics.
-- Push-to-dirty-roots **MUST** dedupe at push time: if the node or any
-  ancestor already has a dirty flag, skip pushing a new ring entry and
-  rely on the ancestor's traversal to cover the descendant. This keeps
-  the ring O(unique-subtrees) rather than O(writes).
+- Push-to-dirty-roots **MUST** dedupe. Single-threaded push
+  (`spatial_node_set_local`, …) dedupes eagerly at push time by walking
+  the ancestor chain. Multi-threaded push (`spatial_node_mark_dirty_mt`)
+  dedupes at push time via atomic flag transition: the thread whose
+  fetch-or transitions the node's dirty flag from 0 to set is the sole
+  publisher of the ring entry; racing threads skip the append. Either
+  way, each node appears at most once per update cycle.
 
 ## Non-goals
 

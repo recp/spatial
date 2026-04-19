@@ -18,8 +18,9 @@ It is the common layer beneath them, defining how "where something is" is repres
 ## What it does
 
 - Scene graph (parent / child / sibling hierarchy)
-- Local and world transform, cached as mat4
-- Transform item chains: translate, rotate, scale, quaternion, look-at, skew, matrix
+- Local and world pose (position + rotation + scale), cached world matrix
+- Matrix override on individual nodes for non-TRS transforms
+  (look-at, skew, CSS-style matrix stacks)
 - Dirty propagation and world matrix update traversal
 - Common spatial state that multiple systems can read and write
 

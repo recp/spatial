@@ -56,6 +56,15 @@ spatial_pose_to_mat4(const spatial_pose_t * __restrict p, mat4 out) {
 
 SPATIAL_EXPORT
 void
+spatial_mat4_to_transform(const mat4 m, spatial_transform_t * __restrict out) {
+  spatial_pose_t p;
+  spatial_mat4_to_pose(m, &p);
+  glm_vec3_copy(p.position, out->position);
+  glm_quat_copy(p.rotation, out->rotation);
+}
+
+SPATIAL_EXPORT
+void
 spatial_mat4_to_pose(const mat4 m, spatial_pose_t * __restrict out) {
   vec3 sx, sy, sz;
   mat4 r;
@@ -431,11 +440,16 @@ void
 spatial_node_mark_dirty_mt(spatial_space_t *space,
                            spatial_node_t   handle,
                            uint32_t         dirty_flag) {
-  uint32_t slot;
-  /* Atomically OR the dirty flag. Always append to dirty_roots — the
-   * compaction pass in spatial_update handles duplicates and ancestor
-   * coverage that this path can't cheaply check under MT races. */
-  SPATIAL_ATOMIC_FETCH_OR_U32(&space->flags[handle.index], dirty_flag);
+  const uint32_t dirty_mask = SPATIAL_NODE_DIRTY_LOCAL | SPATIAL_NODE_DIRTY_WORLD;
+  uint32_t       old_flags, slot;
+
+  /* Atomic fetch_or returns the prior value. The thread that transitions
+   * flags from "no dirty" to "dirty" is the unique publisher of this
+   * node's dirty_roots slot; other racing threads only OR in additional
+   * dirty bits and skip the append. This guarantees each node appears
+   * at most once in dirty_roots even under concurrent mark_dirty_mt. */
+  old_flags = SPATIAL_ATOMIC_FETCH_OR_U32(&space->flags[handle.index], dirty_flag);
+  if (old_flags & dirty_mask) return;  /* someone else pushed */
 
   slot = SPATIAL_ATOMIC_FETCH_ADD_U32(&space->dirty_count, 1u);
   /* Caller must reserve capacity via spatial_space_reserve_dirty. */
@@ -753,6 +767,22 @@ spatial_node_set_matrix(spatial_space_t * __restrict space,
 
   space->flags[handle.index] |= SPATIAL_NODE_HAS_MATRIX;
   spatial__push_dirty(space, handle, SPATIAL_NODE_DIRTY_LOCAL);
+}
+
+SPATIAL_EXPORT
+void
+spatial_node_set_physics_authority(spatial_space_t *space,
+                                   spatial_node_t   handle,
+                                   bool             owns) {
+  if (!spatial_node_valid(space, handle)) return;
+  if (owns) {
+    space->flags[handle.index] |= SPATIAL_NODE_PHYSICS_OWNS;
+    spatial__push_dirty(space, handle, SPATIAL_NODE_DIRTY_WORLD);
+  } else {
+    space->flags[handle.index] &= ~(SPATIAL_NODE_PHYSICS_OWNS | SPATIAL_NODE_KINEMATIC);
+    /* Re-propagate from local: next update composes world from local + parent. */
+    spatial__push_dirty(space, handle, SPATIAL_NODE_DIRTY_LOCAL);
+  }
 }
 
 SPATIAL_EXPORT

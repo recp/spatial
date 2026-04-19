@@ -66,6 +66,13 @@ trusts the caller.
 
 ## Zero-copy writes — physics, animation, direct authority
 
+The reference implementation stores nodes as parallel SoA arrays
+(`space->world_positions`, `space->flags`, …) and exposes these as
+the hot-path write surface. Alternative implementations **MAY**
+choose a different layout so long as the same zero-copy semantics are
+offered through some mechanism; the examples below target the
+reference layout.
+
 Write paths skip the safe setters by mutating SoA slots directly and
 setting the dirty flag. One cache line touched per write.
 

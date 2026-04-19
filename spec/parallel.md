@@ -110,9 +110,12 @@ SPATIAL_EXPORT void spatial_node_mark_dirty_mt(spatial_space_t *space,
                                                uint32_t         dirty_flag);
 ```
 
-Thread-safe. Atomic fetch-or on the flag, atomic fetch-add on the
-ring slot. No ancestor dedupe at push time (the post-update
-compaction handles it).
+Thread-safe. Atomic fetch-or on the dirty flag; the thread whose
+fetch-or transitions the flag from 0 to set is the unique publisher
+of the ring entry (atomic fetch-add). Concurrent threads marking the
+same node only OR in additional dirty bits and skip the append, so
+the ring contains at most one entry per node. Ancestor dedupe is
+handled by `compact_dirty` at dispatch time.
 
 Typical use:
 
@@ -165,8 +168,12 @@ No further synchronization is needed between readers themselves.
 
 An implementation is parallel-conformant iff it:
 
-- treats `spatial_node_mark_dirty_mt` atomically
+- treats `spatial_node_mark_dirty_mt` atomically and dedupes at push
+  time so each node appears at most once in `dirty_roots`
 - runs `compact_dirty` before any dispatch
 - guarantees each dirty-root subtree is traversed by exactly one thread
 - never invalidates a cached pointer during `spatial_update`
-- returns from `spatial_update` only after all workers have joined
+- returns from `spatial_update` only after every worker has finished
+  processing the current dispatch (workers may persist and block on a
+  condition variable between dispatches — they do not need to be
+  `pthread_join`ed per call)
