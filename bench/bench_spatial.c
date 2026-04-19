@@ -90,9 +90,121 @@ bench_deep(uint32_t depth, int iters) {
   spatial_space_destroy(s);
 }
 
+/* Simulates a render loop reading world_matrix for each drawable.
+ * Compares zero-copy pointer accessor vs the safe-copy variant. */
+static void
+bench_render_read(uint32_t n, int iters) {
+  spatial_space_t *s = spatial_space_create(n + 16);
+  spatial_node_t  *handles;
+  volatile float   sink = 0.0f;   /* prevent dead-code elimination */
+  double           t0, t1;
+  uint32_t         i;
+  int              k;
+
+  spatial_space_reserve(s, n + 16);
+  handles = malloc(sizeof(spatial_node_t) * n);
+  for (i = 0; i < n; i++) {
+    spatial_pose_t p = SPATIAL_POSE_IDENTITY;
+    p.position[0] = (float)i;
+    handles[i] = spatial_node_create(s, SPATIAL_NODE_NULL, &p);
+  }
+  spatial_update(s);
+
+  /* --- copy accessor --- */
+  t0 = now_ms();
+  for (k = 0; k < iters; k++) {
+    for (i = 0; i < n; i++) {
+      mat4 m;
+      spatial_node_get_world_matrix(s, handles[i], m);
+      sink += m[3][0];
+    }
+  }
+  t1 = now_ms();
+  printf("  render-read n=%u iters=%d COPY: %.2f ms (%.2f ns/node)\n",
+         n, iters, t1 - t0, (t1 - t0) * 1e6 / ((double)iters * n));
+
+  /* --- zero-copy accessor --- */
+  t0 = now_ms();
+  for (k = 0; k < iters; k++) {
+    for (i = 0; i < n; i++) {
+      const mat4 *m = spatial_node_world_matrix(s, handles[i]);
+      sink += (*m)[3][0];
+    }
+  }
+  t1 = now_ms();
+  printf("  render-read n=%u iters=%d PTR:  %.2f ms (%.2f ns/node)\n",
+         n, iters, t1 - t0, (t1 - t0) * 1e6 / ((double)iters * n));
+
+  /* --- direct SoA --- */
+  t0 = now_ms();
+  for (k = 0; k < iters; k++) {
+    for (i = 0; i < n; i++) {
+      sink += s->world_matrices[handles[i].index][3][0];
+    }
+  }
+  t1 = now_ms();
+  printf("  render-read n=%u iters=%d SoA:  %.2f ms (%.2f ns/node)\n",
+         n, iters, t1 - t0, (t1 - t0) * 1e6 / ((double)iters * n));
+
+  (void)sink;
+  free(handles);
+  spatial_space_destroy(s);
+}
+
+static void
+bench_physics_write(uint32_t n, int iters) {
+  /* Measures just the write path (no propagation) for copy-setter vs
+   * direct-SoA. spatial_update is not called inside the timed loops. */
+  spatial_space_t *s = spatial_space_create(n + 16);
+  spatial_node_t  *handles;
+  double           t0, t1;
+  uint32_t         i;
+  int              k;
+
+  spatial_space_reserve(s, n + 16);
+  handles = malloc(sizeof(spatial_node_t) * n);
+  for (i = 0; i < n; i++) {
+    handles[i] = spatial_node_create(s, SPATIAL_NODE_NULL, NULL);
+  }
+  spatial_update(s);
+
+  /* --- copy setter (spatial_node_set_world_physics) --- */
+  t0 = now_ms();
+  for (k = 0; k < iters; k++) {
+    spatial_pose_t w = SPATIAL_POSE_IDENTITY;
+    w.position[0] = (float)k;
+    for (i = 0; i < n; i++) {
+      spatial_node_set_world_physics(s, handles[i], &w);
+    }
+    s->dirty_count = 0;  /* reset without update for pure write measurement */
+    for (i = 0; i < n; i++) s->flags[handles[i].index] &= ~(SPATIAL_NODE_DIRTY_WORLD);
+  }
+  t1 = now_ms();
+  printf("  physics-write n=%u iters=%d SET: %.2f ms (%.2f ns/write)\n",
+         n, iters, t1 - t0, (t1 - t0) * 1e6 / ((double)iters * n));
+
+  /* --- direct SoA write --- */
+  t0 = now_ms();
+  for (k = 0; k < iters; k++) {
+    for (i = 0; i < n; i++) {
+      uint32_t idx = handles[i].index;
+      s->world_positions[idx][0] = (float)k;
+      s->flags[idx] |= SPATIAL_NODE_DIRTY_WORLD | SPATIAL_NODE_PHYSICS_OWNS;
+    }
+    s->dirty_count = 0;
+    for (i = 0; i < n; i++) s->flags[handles[i].index] &= ~(SPATIAL_NODE_DIRTY_WORLD);
+  }
+  t1 = now_ms();
+  printf("  physics-write n=%u iters=%d SoA: %.2f ms (%.2f ns/write)\n",
+         n, iters, t1 - t0, (t1 - t0) * 1e6 / ((double)iters * n));
+
+  free(handles);
+  spatial_space_destroy(s);
+}
+
 static void
 bench_physics_hotpath(uint32_t n, int iters) {
-  /* Simulates a physics solver writing directly to SoA arrays. */
+  /* Write + propagate (spatial_update). */
   spatial_space_t *s = spatial_space_create(n + 16);
   spatial_node_t  *handles;
   double           t0, t1;
@@ -114,7 +226,6 @@ bench_physics_hotpath(uint32_t n, int iters) {
       s->world_positions[idx][0] = (float)(i + k);
       s->flags[idx] |= SPATIAL_NODE_DIRTY_WORLD;
     }
-    /* push dirty roots manually for the benchmark */
     for (i = 0; i < n; i++) s->dirty_roots[i] = handles[i];
     s->dirty_count = n;
     spatial_update(s);
@@ -150,7 +261,13 @@ int main(void) {
   bench_deep(100,  10000);
   bench_deep(1000, 1000);
 
-  printf("\n[physics hot-path]\n");
+  printf("\n[render-read: copy vs zero-copy vs direct SoA]\n");
+  bench_render_read(10000, 1000);
+
+  printf("\n[physics write: copy-setter vs direct SoA]\n");
+  bench_physics_write(10000, 1000);
+
+  printf("\n[physics hot-path: write + propagate]\n");
   bench_physics_hotpath(10000, 200);
 
   return 0;
