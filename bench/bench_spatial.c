@@ -12,11 +12,28 @@
 #include <time.h>
 #include <stdlib.h>
 
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#endif
+
 static double
 now_ms(void) {
+#if defined(_WIN32)
+  static LARGE_INTEGER freq;
+  LARGE_INTEGER        counter;
+
+  if (freq.QuadPart == 0) {
+    QueryPerformanceFrequency(&freq);
+  }
+
+  QueryPerformanceCounter(&counter);
+  return (double)counter.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+#endif
 }
 
 static void
