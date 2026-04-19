@@ -19,8 +19,8 @@ Related specs maintained elsewhere:
 
 ## Status
 
-Draft. The spec tracks [DESIGN.md](../DESIGN.md). Changes to either must
-stay in sync.
+Draft. Changes in this directory MUST stay consistent with the
+implementation in `spatial/`.
 
 ## Conformance terms
 
