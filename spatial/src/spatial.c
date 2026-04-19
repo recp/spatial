@@ -389,6 +389,15 @@ spatial_space_create(uint32_t initial_capacity) {
 
 SPATIAL_EXPORT
 void
+spatial_space_reserve(spatial_space_t *space, uint32_t capacity) {
+  if (!space) return;
+  if (capacity > space->capacity) {
+    spatial__grow_arrays(space, capacity);
+  }
+}
+
+SPATIAL_EXPORT
+void
 spatial_space_destroy(spatial_space_t *space) {
   uint32_t i;
 

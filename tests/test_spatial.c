@@ -241,6 +241,28 @@ TEST(dirty_dedupe) {
   spatial_space_destroy(s);
 }
 
+TEST(reserve_keeps_pointers_stable) {
+  spatial_space_t *s = spatial_space_create(8);
+  spatial_node_t   a;
+  vec4            *p_before;
+  int              i;
+
+  spatial_space_reserve(s, 10000);
+
+  a = spatial_node_create(s, SPATIAL_NODE_NULL, NULL);
+  p_before = &s->world_positions[a.index];
+
+  /* Create many more nodes. With reserve(10000), no realloc happens. */
+  for (i = 0; i < 500; i++) {
+    spatial_node_create(s, SPATIAL_NODE_NULL, NULL);
+  }
+
+  /* Pointer still valid. */
+  CHECK(p_before == &s->world_positions[a.index]);
+
+  spatial_space_destroy(s);
+}
+
 TEST(parallel_update) {
   /* Build many disjoint dirty-root subtrees and verify parallel dispatch
    * produces the same world poses as sequential. */
@@ -378,6 +400,7 @@ int main(void) {
   RUN(node_version_bumps_on_change);
   RUN(dirty_dedupe);
   RUN(soa_direct_access);
+  RUN(reserve_keeps_pointers_stable);
   RUN(parallel_update);
   RUN(basic_hierarchy_2d);
   RUN(rotation_2d);

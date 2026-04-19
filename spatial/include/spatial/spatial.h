@@ -85,6 +85,14 @@ typedef struct spatial_space_t {
 SPATIAL_EXPORT spatial_space_t *spatial_space_create(uint32_t initial_capacity);
 SPATIAL_EXPORT void             spatial_space_destroy(spatial_space_t *space);
 
+/* Pre-allocate storage up to `capacity`. Guarantees no internal realloc
+   (and thus no pointer invalidation) as long as node count stays <=
+   capacity. Callers that cache raw SoA pointers across frames should
+   reserve upfront to the expected maximum. No-op if capacity is already
+   sufficient. */
+SPATIAL_EXPORT void spatial_space_reserve(spatial_space_t *space,
+                                          uint32_t         capacity);
+
 /* Node lifecycle */
 SPATIAL_EXPORT spatial_node_t spatial_node_create(spatial_space_t      *space,
                                                   spatial_node_t        parent,
