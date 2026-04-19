@@ -10,6 +10,15 @@
 
 #include "common.h"
 
+#if !defined(_WIN32)
+#  include <pthread.h>
+#  include <unistd.h>
+#  define SPATIAL_HAS_THREADS 1
+#else
+/* TODO: Windows thread pool via CreateThread / CONDITION_VARIABLE. */
+#  define SPATIAL_HAS_THREADS 0
+#endif
+
 /* ============================================================== */
 /* Static asserts.                                                  */
 /* ============================================================== */
@@ -312,16 +321,29 @@ spatial__push_dirty(spatial_space_t * __restrict space, spatial_node_t handle) {
   space->dirty_roots[space->dirty_count++] = handle;
 }
 
+/* Per-thread traversal context. Main thread uses space->trav_stack;
+   worker threads each own their own ctx. */
+typedef struct spatial__trav_ctx_t {
+  spatial__trav_t *stack;
+  uint32_t         capacity;
+} spatial__trav_ctx_t;
+
 static
 void
-spatial__ensure_trav_capacity(spatial_space_t *space, uint32_t want) {
-  if (space->trav_capacity < want) {
-    uint32_t nc = space->trav_capacity ? space->trav_capacity : SPATIAL_INITIAL_TRAV_CAPACITY;
+spatial__ctx_grow(spatial__trav_ctx_t *ctx, uint32_t want) {
+  if (ctx->capacity < want) {
+    uint32_t nc = ctx->capacity ? ctx->capacity : SPATIAL_INITIAL_TRAV_CAPACITY;
     while (nc < want) nc *= 2;
-    space->trav_stack    = realloc(space->trav_stack, sizeof(spatial__trav_t) * nc);
-    space->trav_capacity = nc;
+    ctx->stack    = realloc(ctx->stack, sizeof(spatial__trav_t) * nc);
+    ctx->capacity = nc;
   }
 }
+
+/* Forward decls for thread pool (defined below spatial_update). */
+#if SPATIAL_HAS_THREADS
+struct spatial__pool_t;
+static void spatial__pool_destroy(struct spatial__pool_t *p);
+#endif
 
 /* ============================================================== */
 /* Space + node lifecycle.                                          */
@@ -371,6 +393,13 @@ spatial_space_destroy(spatial_space_t *space) {
   uint32_t i;
 
   if (!space) return;
+
+#if SPATIAL_HAS_THREADS
+  if (space->pool) {
+    spatial__pool_destroy((struct spatial__pool_t *)space->pool);
+    space->pool = NULL;
+  }
+#endif
 
   for (i = 1; i < space->count; i++) {
     if (space->matrix_overrides[i]) free(space->matrix_overrides[i]);
@@ -691,16 +720,18 @@ spatial_node_clear_matrix(spatial_space_t *space, spatial_node_t handle) {
 
 static
 void
-spatial__traverse_iter(spatial_space_t *space, spatial_node_t start) {
+spatial__traverse_iter(spatial_space_t      *space,
+                       spatial_node_t        start,
+                       spatial__trav_ctx_t  *ctx) {
   spatial__trav_t *stack;
   uint32_t         sp = 0;
   const uint32_t   dirty_mask = SPATIAL_NODE_DIRTY_LOCAL | SPATIAL_NODE_DIRTY_WORLD;
 
   if (!spatial_node_valid(space, start)) return;
 
-  /* initial stack size: max of capacity (depth can't exceed node count) */
-  spatial__ensure_trav_capacity(space, space->capacity);
-  stack = (spatial__trav_t *)space->trav_stack;
+  /* initial stack size: depth bounded by node count */
+  spatial__ctx_grow(ctx, space->capacity);
+  stack = ctx->stack;
   stack[sp++] = (spatial__trav_t){ start, 0u };
 
   while (sp > 0) {
@@ -781,9 +812,9 @@ spatial__traverse_iter(spatial_space_t *space, spatial_node_t start) {
     /* push children */
     child = space->first_children[idx];
     while (!spatial_node_is_null(child)) {
-      if (SPATIAL_UNLIKELY(sp >= space->trav_capacity)) {
-        spatial__ensure_trav_capacity(space, space->trav_capacity * 2);
-        stack = (spatial__trav_t *)space->trav_stack;
+      if (SPATIAL_UNLIKELY(sp >= ctx->capacity)) {
+        spatial__ctx_grow(ctx, ctx->capacity * 2);
+        stack = ctx->stack;
       }
       stack[sp++] = (spatial__trav_t){ child, changed ? 1u : 0u };
       child = space->next_siblings[child.index];
@@ -791,16 +822,186 @@ spatial__traverse_iter(spatial_space_t *space, spatial_node_t start) {
   }
 }
 
+/* ============================================================== */
+/* Thread pool for parallel dirty-root traversal.                   */
+/* Dirty roots are disjoint subtrees (guaranteed by push_dirty       */
+/* ancestor dedupe), so threads can traverse them independently.    */
+/* ============================================================== */
+
+#if SPATIAL_HAS_THREADS
+
+#define SPATIAL_PARALLEL_THRESHOLD 2   /* only dispatch when >=2 roots */
+
+typedef struct spatial__worker_t {
+  pthread_t           thread;
+  spatial__trav_ctx_t ctx;
+  struct spatial__pool_t *pool;
+} spatial__worker_t;
+
+typedef struct spatial__pool_t {
+  spatial__worker_t *workers;
+  uint32_t           worker_count;
+
+  pthread_mutex_t    mutex;
+  pthread_cond_t     work_cv;
+  pthread_cond_t     done_cv;
+
+  uint32_t           next_work;     /* next dirty_root index to claim */
+  uint32_t           work_total;    /* dirty_count this dispatch      */
+  uint32_t           workers_done;  /* items completed                */
+  bool               shutdown;
+
+  spatial_space_t   *space;
+} spatial__pool_t;
+
+static
+void *
+spatial__worker_main(void *arg) {
+  spatial__worker_t *w    = (spatial__worker_t *)arg;
+  spatial__pool_t   *pool = w->pool;
+
+  for (;;) {
+    uint32_t       work_id;
+    spatial_node_t root;
+
+    pthread_mutex_lock(&pool->mutex);
+    while (!pool->shutdown && pool->next_work >= pool->work_total) {
+      pthread_cond_wait(&pool->work_cv, &pool->mutex);
+    }
+    if (pool->shutdown) {
+      pthread_mutex_unlock(&pool->mutex);
+      break;
+    }
+    work_id = pool->next_work++;
+    pthread_mutex_unlock(&pool->mutex);
+
+    root = pool->space->dirty_roots[work_id];
+    spatial__traverse_iter(pool->space, root, &w->ctx);
+
+    pthread_mutex_lock(&pool->mutex);
+    pool->workers_done++;
+    if (pool->workers_done >= pool->work_total) {
+      pthread_cond_signal(&pool->done_cv);
+    }
+    pthread_mutex_unlock(&pool->mutex);
+  }
+  return NULL;
+}
+
+static
+spatial__pool_t *
+spatial__pool_create(spatial_space_t *space, uint32_t n) {
+  spatial__pool_t *p;
+  uint32_t         i;
+
+  p = calloc(1, sizeof(*p));
+  p->worker_count = n;
+  p->space        = space;
+  p->workers      = calloc(n, sizeof(spatial__worker_t));
+  pthread_mutex_init(&p->mutex, NULL);
+  pthread_cond_init(&p->work_cv, NULL);
+  pthread_cond_init(&p->done_cv, NULL);
+
+  for (i = 0; i < n; i++) {
+    p->workers[i].pool = p;
+    pthread_create(&p->workers[i].thread, NULL, spatial__worker_main, &p->workers[i]);
+  }
+  return p;
+}
+
+static
+void
+spatial__pool_destroy(spatial__pool_t *p) {
+  uint32_t i;
+  if (!p) return;
+
+  pthread_mutex_lock(&p->mutex);
+  p->shutdown = true;
+  pthread_cond_broadcast(&p->work_cv);
+  pthread_mutex_unlock(&p->mutex);
+
+  for (i = 0; i < p->worker_count; i++) {
+    pthread_join(p->workers[i].thread, NULL);
+    free(p->workers[i].ctx.stack);
+  }
+  pthread_mutex_destroy(&p->mutex);
+  pthread_cond_destroy(&p->work_cv);
+  pthread_cond_destroy(&p->done_cv);
+  free(p->workers);
+  free(p);
+}
+
+static
+void
+spatial__pool_dispatch(spatial__pool_t *p, uint32_t total) {
+  if (total == 0) return;
+
+  pthread_mutex_lock(&p->mutex);
+  p->next_work    = 0;
+  p->work_total   = total;
+  p->workers_done = 0;
+  pthread_cond_broadcast(&p->work_cv);
+  while (p->workers_done < total) {
+    pthread_cond_wait(&p->done_cv, &p->mutex);
+  }
+  pthread_mutex_unlock(&p->mutex);
+}
+
+SPATIAL_EXPORT
+void
+spatial_space_enable_parallel(spatial_space_t *space, uint32_t thread_count) {
+  if (!space || space->pool) return;
+  if (thread_count == 0) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    thread_count = (n > 1) ? (uint32_t)n : 2;
+  }
+  space->pool = spatial__pool_create(space, thread_count);
+}
+
+#else  /* !SPATIAL_HAS_THREADS */
+
+SPATIAL_EXPORT
+void
+spatial_space_enable_parallel(spatial_space_t *space, uint32_t thread_count) {
+  (void)space; (void)thread_count;
+  /* threads disabled on this platform; spatial_update stays sequential */
+}
+
+#endif
+
 SPATIAL_EXPORT
 void
 spatial_update(spatial_space_t * __restrict space) {
-  uint32_t i;
+  spatial__trav_ctx_t main_ctx;
+  uint32_t            i;
 
   if (!space) return;
 
-  for (i = 0; i < space->dirty_count; i++) {
-    spatial__traverse_iter(space, space->dirty_roots[i]);
+  if (space->dirty_count == 0) {
+    space->update_version++;
+    return;
   }
+
+#if SPATIAL_HAS_THREADS
+  if (space->pool && space->dirty_count >= SPATIAL_PARALLEL_THRESHOLD) {
+    spatial__pool_dispatch((spatial__pool_t *)space->pool, space->dirty_count);
+    space->dirty_count = 0;
+    space->update_version++;
+    return;
+  }
+#endif
+
+  /* Sequential path. Reuse space->trav_stack as main_ctx storage. */
+  main_ctx.stack    = (spatial__trav_t *)space->trav_stack;
+  main_ctx.capacity = space->trav_capacity;
+
+  for (i = 0; i < space->dirty_count; i++) {
+    spatial__traverse_iter(space, space->dirty_roots[i], &main_ctx);
+  }
+
+  /* reclaim possibly-grown storage into space */
+  space->trav_stack    = main_ctx.stack;
+  space->trav_capacity = main_ctx.capacity;
 
   space->dirty_count = 0;
   space->update_version++;

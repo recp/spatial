@@ -69,9 +69,13 @@ typedef struct spatial_space_t {
   uint32_t         dirty_count;
   uint32_t         dirty_capacity;
 
-  /* iterative traversal scratch (grown lazily) */
+  /* iterative traversal scratch — main-thread stack (grown lazily) */
   void            *trav_stack;
   uint32_t         trav_capacity;
+
+  /* Thread pool for parallel dirty-root traversal.
+     NULL unless spatial_space_enable_parallel() was called. */
+  void            *pool;
 
   uint64_t         update_version;
   uint32_t         space_flags;
@@ -134,6 +138,12 @@ SPATIAL_EXPORT void spatial_node_clear_matrix(spatial_space_t *space,
 
 /* Update */
 SPATIAL_EXPORT void spatial_update(spatial_space_t *space);
+
+/* Enable parallel spatial_update. Pass thread_count=0 to use hardware
+   concurrency. Must be called before the first parallel-capable update.
+   Sequential updates still work after enabling (single dirty root, etc.). */
+SPATIAL_EXPORT void spatial_space_enable_parallel(spatial_space_t *space,
+                                                  uint32_t         thread_count);
 
 /* ================================================================== */
 /* 2D API. Parallel to 3D, same SoA discipline.                       */

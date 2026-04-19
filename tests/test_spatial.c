@@ -241,6 +241,53 @@ TEST(dirty_dedupe) {
   spatial_space_destroy(s);
 }
 
+TEST(parallel_update) {
+  /* Build many disjoint dirty-root subtrees and verify parallel dispatch
+   * produces the same world poses as sequential. */
+  spatial_space_t *s = spatial_space_create(256);
+  spatial_pose_t   step = SPATIAL_POSE_IDENTITY;
+  spatial_node_t   roots[64];
+  spatial_node_t   children[64];
+  const int        n = 64;
+  spatial_pose_t   w;
+  int              i;
+
+  spatial_space_enable_parallel(s, 4);
+
+  step.position[0] = 1.0f;
+  for (i = 0; i < n; i++) {
+    spatial_pose_t rp = SPATIAL_POSE_IDENTITY;
+    rp.position[1] = (float)i;
+    roots[i]    = spatial_node_create(s, SPATIAL_NODE_NULL, &rp);
+    children[i] = spatial_node_create(s, roots[i], &step);
+  }
+
+  spatial_update(s);
+
+  /* every child should have world = (1, i, 0) */
+  for (i = 0; i < n; i++) {
+    spatial_node_get_world(s, children[i], &w);
+    CHECK_FLOAT(w.position[0], 1.0f);
+    CHECK_FLOAT(w.position[1], (float)i);
+  }
+
+  /* mutate all roots, expect children to follow */
+  for (i = 0; i < n; i++) {
+    spatial_pose_t rp = SPATIAL_POSE_IDENTITY;
+    rp.position[0] = 10.0f;
+    rp.position[1] = (float)i * 2.0f;
+    spatial_node_set_local(s, roots[i], &rp);
+  }
+  spatial_update(s);
+  for (i = 0; i < n; i++) {
+    spatial_node_get_world(s, children[i], &w);
+    CHECK_FLOAT(w.position[0], 11.0f);
+    CHECK_FLOAT(w.position[1], (float)i * 2.0f);
+  }
+
+  spatial_space_destroy(s);
+}
+
 TEST(soa_direct_access) {
   /* Data-oriented hot path: physics writes directly to SoA arrays. */
   spatial_space_t *s = spatial_space_create(8);
@@ -331,6 +378,7 @@ int main(void) {
   RUN(node_version_bumps_on_change);
   RUN(dirty_dedupe);
   RUN(soa_direct_access);
+  RUN(parallel_update);
   RUN(basic_hierarchy_2d);
   RUN(rotation_2d);
   RUN(rot2_mul_composition);
