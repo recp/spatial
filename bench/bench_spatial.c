@@ -1,0 +1,148 @@
+/*
+ * Minimal benchmark suite. Measures update throughput across hierarchy
+ * shapes and parallel vs sequential dispatch.
+ *
+ * Build:
+ *   cmake -B build -DSPATIAL_BUILD_BENCH=ON && cmake --build build
+ *   ./build/bench_spatial
+ */
+
+#include <spatial/spatial.h>
+#include <stdio.h>
+#include <time.h>
+#include <stdlib.h>
+
+static double
+now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+static void
+bench_flat(uint32_t n, int iters, bool parallel) {
+  spatial_space_t *s = spatial_space_create(n + 16);
+  spatial_node_t  *handles;
+  spatial_pose_t   p = SPATIAL_POSE_IDENTITY;
+  double           t0, t1;
+  uint32_t         i;
+  int              k;
+
+  spatial_space_reserve(s, n + 16);
+  if (parallel) spatial_space_enable_parallel(s, 0);
+
+  handles = malloc(sizeof(spatial_node_t) * n);
+  for (i = 0; i < n; i++) {
+    p.position[0] = (float)i;
+    handles[i] = spatial_node_create(s, SPATIAL_NODE_NULL, &p);
+  }
+  spatial_update(s);  /* warmup */
+
+  t0 = now_ms();
+  for (k = 0; k < iters; k++) {
+    for (i = 0; i < n; i++) {
+      p.position[0] = (float)(i + k);
+      spatial_node_set_local(s, handles[i], &p);
+    }
+    spatial_update(s);
+  }
+  t1 = now_ms();
+
+  printf("  flat n=%u iters=%d %s: %.2f ms (%.2f us/update, %.2f ns/node)\n",
+         n, iters, parallel ? "parallel" : "sequential",
+         t1 - t0,
+         (t1 - t0) * 1000.0 / iters,
+         (t1 - t0) * 1e6 / ((double)iters * n));
+
+  free(handles);
+  spatial_space_destroy(s);
+}
+
+static void
+bench_deep(uint32_t depth, int iters) {
+  spatial_space_t *s = spatial_space_create(depth + 16);
+  spatial_node_t   leaf = SPATIAL_NODE_NULL;
+  spatial_pose_t   step = SPATIAL_POSE_IDENTITY;
+  double           t0, t1;
+  uint32_t         i;
+  int              k;
+
+  spatial_space_reserve(s, depth + 16);
+  step.position[0] = 1.0f;
+
+  for (i = 0; i < depth; i++) {
+    leaf = spatial_node_create(s, leaf, &step);
+  }
+  spatial_update(s);  /* warmup */
+
+  t0 = now_ms();
+  for (k = 0; k < iters; k++) {
+    step.position[1] = (float)k;
+    /* force full re-propagation by dirtying the root chain */
+    spatial_node_set_local(s, leaf, &step);
+    spatial_update(s);
+  }
+  t1 = now_ms();
+
+  printf("  deep depth=%u iters=%d: %.2f ms (%.2f us/update)\n",
+         depth, iters, t1 - t0, (t1 - t0) * 1000.0 / iters);
+
+  spatial_space_destroy(s);
+}
+
+static void
+bench_physics_hotpath(uint32_t n, int iters) {
+  /* Simulates a physics solver writing directly to SoA arrays. */
+  spatial_space_t *s = spatial_space_create(n + 16);
+  spatial_node_t  *handles;
+  double           t0, t1;
+  uint32_t         i;
+  int              k;
+
+  spatial_space_reserve(s, n + 16);
+  handles = malloc(sizeof(spatial_node_t) * n);
+  for (i = 0; i < n; i++) {
+    handles[i] = spatial_node_create(s, SPATIAL_NODE_NULL, NULL);
+    s->flags[handles[i].index] |= SPATIAL_NODE_PHYSICS_OWNS;
+  }
+  spatial_update(s);
+
+  t0 = now_ms();
+  for (k = 0; k < iters; k++) {
+    for (i = 0; i < n; i++) {
+      uint32_t idx = handles[i].index;
+      s->world_positions[idx][0] = (float)(i + k);
+      s->flags[idx] |= SPATIAL_NODE_DIRTY_WORLD;
+    }
+    /* push dirty roots manually for the benchmark */
+    for (i = 0; i < n; i++) s->dirty_roots[i] = handles[i];
+    s->dirty_count = n;
+    spatial_update(s);
+  }
+  t1 = now_ms();
+
+  printf("  physics-hotpath n=%u iters=%d: %.2f ms (%.2f ns/write+propagate)\n",
+         n, iters, t1 - t0,
+         (t1 - t0) * 1e6 / ((double)iters * n));
+
+  free(handles);
+  spatial_space_destroy(s);
+}
+
+int main(void) {
+  printf("spatial benchmarks\n");
+
+  printf("\n[flat hierarchy]\n");
+  bench_flat(1000,  1000, false);
+  bench_flat(10000, 200,  false);
+  bench_flat(10000, 200,  true);
+
+  printf("\n[deep chain]\n");
+  bench_deep(100,  10000);
+  bench_deep(1000, 1000);
+
+  printf("\n[physics hot-path]\n");
+  bench_physics_hotpath(10000, 200);
+
+  return 0;
+}

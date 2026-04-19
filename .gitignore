@@ -1,0 +1,10 @@
+build/
+build-*/
+*.o
+*.lo
+*.obj
+*.dSYM
+*.xcodeproj/xcuserdata
+.vscode/
+.cache/
+compile_commands.json

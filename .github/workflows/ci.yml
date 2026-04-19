@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        sanitizer: [none, asan, tsan, ubsan]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cglm
+        run: |
+          git clone --depth 1 https://github.com/recp/cglm /tmp/cglm
+          cmake -S /tmp/cglm -B /tmp/cglm/build -DCMAKE_INSTALL_PREFIX=/usr/local -DCGLM_STATIC=ON -DCGLM_USE_TEST=OFF
+          sudo cmake --build /tmp/cglm/build --target install
+      - name: Configure
+        run: |
+          FLAGS=""
+          case "${{ matrix.sanitizer }}" in
+            asan)  FLAGS="-DSPATIAL_ENABLE_ASAN=ON" ;;
+            tsan)  FLAGS="-DSPATIAL_ENABLE_TSAN=ON" ;;
+            ubsan) FLAGS="-DSPATIAL_ENABLE_UBSAN=ON" ;;
+          esac
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug $FLAGS
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cglm
+        run: brew install cglm || true
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cglm
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/recp/cglm /tmp/cglm
+          cmake -S /tmp/cglm -B /tmp/cglm/build -DCGLM_STATIC=ON -DCGLM_USE_TEST=OFF
+          cmake --build /tmp/cglm/build --config Release
+          cmake --install /tmp/cglm/build --prefix "$GITHUB_WORKSPACE/deps"
+      - name: Configure
+        shell: bash
+        run: cmake -S . -B build -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/deps"
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
