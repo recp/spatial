@@ -42,7 +42,15 @@ When graphics, physics, animation, and audio share one spatial model, integratio
 - audio reads world position ← spatial
 - editor authors local transform → spatial
 
-No per-integration sync adapters. One spatial contract.
+The goal is to reduce duplicate transform code, reduce sync cost, and define one spatial contract.
+
+More specifically, `spatial` exists to standardize:
+
+- a shared pose / transform ABI
+- shared pose semantics (`local`, `world`, hierarchy, authority)
+- a shared update contract between systems
+
+That matters because the real cost is often not the transform math itself, but repeated conversion, duplicate storage, cache rebuilds, and sync bugs between frameworks.
 
 ## Authority
 
