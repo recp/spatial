@@ -9,15 +9,13 @@
  */
 
 #include "common.h"
+#include "thread/thread.h"
 
-#if !defined(_WIN32)
-#  include <pthread.h>
-#  include <unistd.h>
-#  define SPATIAL_HAS_THREADS 1
-#else
-/* TODO: Windows thread pool via CreateThread / CONDITION_VARIABLE. */
-#  define SPATIAL_HAS_THREADS 0
-#endif
+#define SPATIAL_HAS_THREADS 1
+
+/* Fail-fast on allocation failure. Replace this macro in a downstream
+ * build if you need a different out-of-memory policy. */
+#define SPATIAL_OOM_CHECK(p) do { if (SPATIAL_UNLIKELY(!(p))) abort(); } while (0)
 
 /* ============================================================== */
 /* Static asserts.                                                  */
@@ -108,6 +106,7 @@ spatial_pose_compose(const spatial_pose_t * __restrict a,
   glm_vec3_add((float *)a->position, rotated, pos);
 
   glm_quat_mul((float *)a->rotation, (float *)b->rotation, rot);
+  glm_quat_normalize(rot);  /* guard against long-run drift */
   glm_vec3_mul((float *)a->scale, (float *)b->scale, scl);
 
   glm_vec3_copy(pos, out->position);
@@ -136,6 +135,7 @@ spatial__compose_slots(const vec4 pa, const versor qa, const vec4 sa,
   po[3] = 0.0f;
 
   glm_quat_mul((float *)qa, (float *)qb, qo);
+  glm_quat_normalize(qo);  /* guard against long-run drift */
 
   /* so = a.scale * b.scale — SIMD 4-lane */
   glm_vec4_mul((float *)sa, (float *)sb, so);
@@ -247,22 +247,22 @@ void
 spatial__grow_arrays(spatial_space_t *space, uint32_t new_cap) {
   uint32_t old_cap = space->capacity;
 
-  space->generations     = realloc(space->generations,     sizeof(uint32_t)       * new_cap);
-  space->parents         = realloc(space->parents,         sizeof(spatial_node_t) * new_cap);
-  space->first_children  = realloc(space->first_children,  sizeof(spatial_node_t) * new_cap);
-  space->next_siblings   = realloc(space->next_siblings,   sizeof(spatial_node_t) * new_cap);
-  space->local_positions = realloc(space->local_positions, sizeof(vec4)           * new_cap);
-  space->local_rotations = realloc(space->local_rotations, sizeof(versor)         * new_cap);
-  space->local_scales    = realloc(space->local_scales,    sizeof(vec4)           * new_cap);
-  space->world_positions = realloc(space->world_positions, sizeof(vec4)           * new_cap);
-  space->world_rotations = realloc(space->world_rotations, sizeof(versor)         * new_cap);
-  space->world_scales    = realloc(space->world_scales,    sizeof(vec4)           * new_cap);
-  space->world_matrices  = realloc(space->world_matrices,  sizeof(mat4)           * new_cap);
-  space->flags           = realloc(space->flags,           sizeof(uint32_t)       * new_cap);
-  space->versions        = realloc(space->versions,        sizeof(uint32_t)       * new_cap);
-  space->users           = realloc(space->users,           sizeof(void *)         * new_cap);
+  space->generations     = realloc(space->generations,     sizeof(uint32_t)       * new_cap); SPATIAL_OOM_CHECK(space->generations);
+  space->parents         = realloc(space->parents,         sizeof(spatial_node_t) * new_cap); SPATIAL_OOM_CHECK(space->parents);
+  space->first_children  = realloc(space->first_children,  sizeof(spatial_node_t) * new_cap); SPATIAL_OOM_CHECK(space->first_children);
+  space->next_siblings   = realloc(space->next_siblings,   sizeof(spatial_node_t) * new_cap); SPATIAL_OOM_CHECK(space->next_siblings);
+  space->local_positions = realloc(space->local_positions, sizeof(vec4)           * new_cap); SPATIAL_OOM_CHECK(space->local_positions);
+  space->local_rotations = realloc(space->local_rotations, sizeof(versor)         * new_cap); SPATIAL_OOM_CHECK(space->local_rotations);
+  space->local_scales    = realloc(space->local_scales,    sizeof(vec4)           * new_cap); SPATIAL_OOM_CHECK(space->local_scales);
+  space->world_positions = realloc(space->world_positions, sizeof(vec4)           * new_cap); SPATIAL_OOM_CHECK(space->world_positions);
+  space->world_rotations = realloc(space->world_rotations, sizeof(versor)         * new_cap); SPATIAL_OOM_CHECK(space->world_rotations);
+  space->world_scales    = realloc(space->world_scales,    sizeof(vec4)           * new_cap); SPATIAL_OOM_CHECK(space->world_scales);
+  space->world_matrices  = realloc(space->world_matrices,  sizeof(mat4)           * new_cap); SPATIAL_OOM_CHECK(space->world_matrices);
+  space->flags           = realloc(space->flags,           sizeof(uint32_t)       * new_cap); SPATIAL_OOM_CHECK(space->flags);
+  space->versions        = realloc(space->versions,        sizeof(uint32_t)       * new_cap); SPATIAL_OOM_CHECK(space->versions);
+  space->users           = realloc(space->users,           sizeof(void *)         * new_cap); SPATIAL_OOM_CHECK(space->users);
   space->matrix_overrides= realloc(space->matrix_overrides,
-                                   sizeof(spatial_matrix_override_t *) * new_cap);
+                                   sizeof(spatial_matrix_override_t *) * new_cap);            SPATIAL_OOM_CHECK(space->matrix_overrides);
 
   if (new_cap > old_cap) {
     uint32_t delta = new_cap - old_cap;
@@ -297,25 +297,44 @@ spatial__alloc_slot(spatial_space_t * __restrict space) {
   return slot;
 }
 
-/* Dirty push with ancestor dedupe: skip if any ancestor is already dirty. */
+/* Dirty push with dedupe. Sets the requested dirty flag and:
+ *   - if this node is already tracked (own flag set) → just OR in flag, skip push
+ *   - if any ancestor is already tracked → set flag, skip push (ancestor covers us)
+ *   - otherwise push to dirty_roots
+ * This guarantees each node appears in dirty_roots at most once per cycle. */
 static
 void
-spatial__push_dirty(spatial_space_t * __restrict space, spatial_node_t handle) {
-  spatial_node_t a;
+spatial__push_dirty(spatial_space_t * __restrict space,
+                    spatial_node_t                handle,
+                    uint32_t                      dirty_flag) {
   const uint32_t dirty_mask = SPATIAL_NODE_DIRTY_LOCAL | SPATIAL_NODE_DIRTY_WORLD;
+  uint32_t       idx = handle.index;
+  spatial_node_t a;
 
-  a = space->parents[handle.index];
+  /* Self already tracked? */
+  if (space->flags[idx] & dirty_mask) {
+    space->flags[idx] |= dirty_flag;
+    return;
+  }
+
+  /* Ancestor tracked? */
+  a = space->parents[idx];
   while (!spatial_node_is_null(a)) {
     if (SPATIAL_UNLIKELY(a.index >= space->capacity)) break;
     if (space->flags[a.index] & dirty_mask) {
-      return;  /* ancestor will cover us */
+      space->flags[idx] |= dirty_flag;  /* mark for traversal */
+      return;
     }
     a = space->parents[a.index];
   }
 
+  /* Not tracked — set flag and push. */
+  space->flags[idx] |= dirty_flag;
+
   if (SPATIAL_UNLIKELY(space->dirty_count >= space->dirty_capacity)) {
     uint32_t nc = space->dirty_capacity * 2;
     space->dirty_roots    = realloc(space->dirty_roots, sizeof(spatial_node_t) * nc);
+    SPATIAL_OOM_CHECK(space->dirty_roots);
     space->dirty_capacity = nc;
   }
   space->dirty_roots[space->dirty_count++] = handle;
@@ -476,7 +495,7 @@ spatial_node_create(spatial_space_t      * __restrict space,
   glm_quat_identity(space->world_rotations[slot]);
   glm_vec4_one(space->world_scales[slot]);
   glm_mat4_identity(space->world_matrices[slot]);
-  space->flags[slot]            = SPATIAL_NODE_ALIVE | SPATIAL_NODE_DIRTY_LOCAL;
+  space->flags[slot]            = SPATIAL_NODE_ALIVE;
   space->versions[slot]         = 1;
   space->users[slot]            = NULL;
   space->matrix_overrides[slot] = NULL;
@@ -488,7 +507,7 @@ spatial_node_create(spatial_space_t      * __restrict space,
   /* patch sibling link we stored above with correct generation */
   space->first_children[parent.index] = handle;
 
-  spatial__push_dirty(space, handle);
+  spatial__push_dirty(space, handle, SPATIAL_NODE_DIRTY_LOCAL);
   return handle;
 }
 
@@ -577,8 +596,7 @@ spatial_node_attach(spatial_space_t * __restrict space,
   space->next_siblings[child.index]        = space->first_children[new_parent.index];
   space->first_children[new_parent.index]  = child;
 
-  space->flags[child.index] |= SPATIAL_NODE_DIRTY_LOCAL;
-  spatial__push_dirty(space, child);
+  spatial__push_dirty(space, child, SPATIAL_NODE_DIRTY_LOCAL);
   return true;
 }
 
@@ -597,8 +615,7 @@ spatial_node_set_local(spatial_space_t      * __restrict space,
   glm_quat_copy((float *)local->rotation, space->local_rotations[handle.index]);
   glm_vec3_copy((float *)local->scale,    space->local_scales[handle.index]);
   space->local_scales[handle.index][3]    = 0.0f;
-  space->flags[handle.index] |= SPATIAL_NODE_DIRTY_LOCAL;
-  spatial__push_dirty(space, handle);
+  spatial__push_dirty(space, handle, SPATIAL_NODE_DIRTY_LOCAL);
 }
 
 SPATIAL_EXPORT
@@ -624,8 +641,8 @@ spatial_node_set_world_physics(spatial_space_t      * __restrict space,
   glm_quat_copy((float *)world->rotation, space->world_rotations[handle.index]);
   glm_vec3_copy((float *)world->scale,    space->world_scales[handle.index]);
   space->world_scales[handle.index][3]    = 0.0f;
-  space->flags[handle.index] |= SPATIAL_NODE_DIRTY_WORLD | SPATIAL_NODE_PHYSICS_OWNS;
-  spatial__push_dirty(space, handle);
+  space->flags[handle.index] |= SPATIAL_NODE_PHYSICS_OWNS;
+  spatial__push_dirty(space, handle, SPATIAL_NODE_DIRTY_WORLD);
 }
 
 SPATIAL_EXPORT
@@ -706,8 +723,8 @@ spatial_node_set_matrix(spatial_space_t * __restrict space,
   glm_vec3_copy(pose.scale,    space->local_scales[handle.index]);
   space->local_scales[handle.index][3]    = 0.0f;
 
-  space->flags[handle.index] |= SPATIAL_NODE_HAS_MATRIX | SPATIAL_NODE_DIRTY_LOCAL;
-  spatial__push_dirty(space, handle);
+  space->flags[handle.index] |= SPATIAL_NODE_HAS_MATRIX;
+  spatial__push_dirty(space, handle, SPATIAL_NODE_DIRTY_LOCAL);
 }
 
 SPATIAL_EXPORT
@@ -719,8 +736,7 @@ spatial_node_clear_matrix(spatial_space_t *space, spatial_node_t handle) {
     space->matrix_overrides[handle.index] = NULL;
   }
   space->flags[handle.index] &= ~SPATIAL_NODE_HAS_MATRIX;
-  space->flags[handle.index] |= SPATIAL_NODE_DIRTY_LOCAL;
-  spatial__push_dirty(space, handle);
+  spatial__push_dirty(space, handle, SPATIAL_NODE_DIRTY_LOCAL);
 }
 
 /* ============================================================== */
@@ -837,64 +853,66 @@ spatial__traverse_iter(spatial_space_t      *space,
 /* ancestor dedupe), so threads can traverse them independently.    */
 /* ============================================================== */
 
-#if SPATIAL_HAS_THREADS
-
-#define SPATIAL_PARALLEL_THRESHOLD 2   /* only dispatch when >=2 roots */
+#define SPATIAL_PARALLEL_THRESHOLD 8   /* below this, dispatch overhead outweighs */
+#define SPATIAL_WORK_CHUNK          8   /* grab N roots per mutex lock */
 
 typedef struct spatial__worker_t {
-  pthread_t           thread;
-  spatial__trav_ctx_t ctx;
+  spatial_thread_t       *thread;
+  spatial__trav_ctx_t     ctx;
   struct spatial__pool_t *pool;
 } spatial__worker_t;
 
 typedef struct spatial__pool_t {
-  spatial__worker_t *workers;
-  uint32_t           worker_count;
+  spatial__worker_t      *workers;
+  uint32_t                worker_count;
 
-  pthread_mutex_t    mutex;
-  pthread_cond_t     work_cv;
-  pthread_cond_t     done_cv;
+  spatial_thread_mutex_t  mutex;
+  spatial_thread_cond_t   work_cv;
+  spatial_thread_cond_t   done_cv;
 
-  uint32_t           next_work;     /* next dirty_root index to claim */
-  uint32_t           work_total;    /* dirty_count this dispatch      */
-  uint32_t           workers_done;  /* items completed                */
-  bool               shutdown;
+  uint32_t                next_work;
+  uint32_t                work_total;
+  uint32_t                workers_done;
+  bool                    shutdown;
 
-  spatial_space_t   *space;
+  spatial_space_t        *space;
 } spatial__pool_t;
 
 static
-void *
+void
 spatial__worker_main(void *arg) {
   spatial__worker_t *w    = (spatial__worker_t *)arg;
   spatial__pool_t   *pool = w->pool;
 
   for (;;) {
-    uint32_t       work_id;
-    spatial_node_t root;
+    uint32_t start, end, i;
 
-    pthread_mutex_lock(&pool->mutex);
+    /* Grab a chunk of roots per lock to amortize mutex overhead. */
+    spatial_thread_mutex_lock(&pool->mutex);
     while (!pool->shutdown && pool->next_work >= pool->work_total) {
-      pthread_cond_wait(&pool->work_cv, &pool->mutex);
+      spatial_thread_cond_wait(&pool->work_cv, &pool->mutex);
     }
     if (pool->shutdown) {
-      pthread_mutex_unlock(&pool->mutex);
+      spatial_thread_mutex_unlock(&pool->mutex);
       break;
     }
-    work_id = pool->next_work++;
-    pthread_mutex_unlock(&pool->mutex);
+    start = pool->next_work;
+    end   = start + SPATIAL_WORK_CHUNK;
+    if (end > pool->work_total) end = pool->work_total;
+    pool->next_work = end;
+    spatial_thread_mutex_unlock(&pool->mutex);
 
-    root = pool->space->dirty_roots[work_id];
-    spatial__traverse_iter(pool->space, root, &w->ctx);
-
-    pthread_mutex_lock(&pool->mutex);
-    pool->workers_done++;
-    if (pool->workers_done >= pool->work_total) {
-      pthread_cond_signal(&pool->done_cv);
+    for (i = start; i < end; i++) {
+      spatial__traverse_iter(pool->space, pool->space->dirty_roots[i], &w->ctx);
     }
-    pthread_mutex_unlock(&pool->mutex);
+
+    spatial_thread_mutex_lock(&pool->mutex);
+    pool->workers_done += (end - start);
+    if (pool->workers_done >= pool->work_total) {
+      spatial_thread_cond_signal(&pool->done_cv);
+    }
+    spatial_thread_mutex_unlock(&pool->mutex);
   }
-  return NULL;
 }
 
 static
@@ -904,38 +922,43 @@ spatial__pool_create(spatial_space_t *space, uint32_t n) {
   uint32_t         i;
 
   p = calloc(1, sizeof(*p));
+  SPATIAL_OOM_CHECK(p);
   p->worker_count = n;
   p->space        = space;
   p->workers      = calloc(n, sizeof(spatial__worker_t));
-  pthread_mutex_init(&p->mutex, NULL);
-  pthread_cond_init(&p->work_cv, NULL);
-  pthread_cond_init(&p->done_cv, NULL);
+  SPATIAL_OOM_CHECK(p->workers);
+
+  spatial_thread_mutex_init(&p->mutex);
+  spatial_thread_cond_init(&p->work_cv);
+  spatial_thread_cond_init(&p->done_cv);
 
   for (i = 0; i < n; i++) {
-    p->workers[i].pool = p;
-    pthread_create(&p->workers[i].thread, NULL, spatial__worker_main, &p->workers[i]);
+    p->workers[i].pool   = p;
+    p->workers[i].thread = spatial_thread_new(spatial__worker_main, &p->workers[i]);
+    SPATIAL_OOM_CHECK(p->workers[i].thread);
   }
   return p;
 }
 
 static
 void
-spatial__pool_destroy(spatial__pool_t *p) {
+spatial__pool_destroy(struct spatial__pool_t *p) {
   uint32_t i;
   if (!p) return;
 
-  pthread_mutex_lock(&p->mutex);
+  spatial_thread_mutex_lock(&p->mutex);
   p->shutdown = true;
-  pthread_cond_broadcast(&p->work_cv);
-  pthread_mutex_unlock(&p->mutex);
+  spatial_thread_cond_broadcast(&p->work_cv);
+  spatial_thread_mutex_unlock(&p->mutex);
 
   for (i = 0; i < p->worker_count; i++) {
-    pthread_join(p->workers[i].thread, NULL);
+    spatial_thread_join(p->workers[i].thread);
+    spatial_thread_free(p->workers[i].thread);
     free(p->workers[i].ctx.stack);
   }
-  pthread_mutex_destroy(&p->mutex);
-  pthread_cond_destroy(&p->work_cv);
-  pthread_cond_destroy(&p->done_cv);
+  spatial_thread_mutex_destroy(&p->mutex);
+  spatial_thread_cond_destroy(&p->work_cv);
+  spatial_thread_cond_destroy(&p->done_cv);
   free(p->workers);
   free(p);
 }
@@ -945,15 +968,15 @@ void
 spatial__pool_dispatch(spatial__pool_t *p, uint32_t total) {
   if (total == 0) return;
 
-  pthread_mutex_lock(&p->mutex);
+  spatial_thread_mutex_lock(&p->mutex);
   p->next_work    = 0;
   p->work_total   = total;
   p->workers_done = 0;
-  pthread_cond_broadcast(&p->work_cv);
+  spatial_thread_cond_broadcast(&p->work_cv);
   while (p->workers_done < total) {
-    pthread_cond_wait(&p->done_cv, &p->mutex);
+    spatial_thread_cond_wait(&p->done_cv, &p->mutex);
   }
-  pthread_mutex_unlock(&p->mutex);
+  spatial_thread_mutex_unlock(&p->mutex);
 }
 
 SPATIAL_EXPORT
@@ -961,22 +984,42 @@ void
 spatial_space_enable_parallel(spatial_space_t *space, uint32_t thread_count) {
   if (!space || space->pool) return;
   if (thread_count == 0) {
-    long n = sysconf(_SC_NPROCESSORS_ONLN);
-    thread_count = (n > 1) ? (uint32_t)n : 2;
+    thread_count = spatial_thread_hw_concurrency();
+    if (thread_count < 2) thread_count = 2;
   }
   space->pool = spatial__pool_create(space, thread_count);
 }
 
-#else  /* !SPATIAL_HAS_THREADS */
-
-SPATIAL_EXPORT
+/* Compact dirty_roots by dropping entries whose ancestor is also dirty.
+ * Covers post-attach reparenting where a previously-independent dirty
+ * node became a descendant of another dirty node. Must run before any
+ * traversal dispatch so workers never double-process the same subtree. */
+static
 void
-spatial_space_enable_parallel(spatial_space_t *space, uint32_t thread_count) {
-  (void)space; (void)thread_count;
-  /* threads disabled on this platform; spatial_update stays sequential */
-}
+spatial__compact_dirty(spatial_space_t *space) {
+  const uint32_t dirty_mask = SPATIAL_NODE_DIRTY_LOCAL | SPATIAL_NODE_DIRTY_WORLD;
+  uint32_t       write = 0;
+  uint32_t       i;
 
-#endif
+  for (i = 0; i < space->dirty_count; i++) {
+    spatial_node_t n = space->dirty_roots[i];
+    spatial_node_t a;
+    bool           redundant = false;
+
+    if (!spatial_node_valid(space, n)) continue;
+
+    a = space->parents[n.index];
+    while (!spatial_node_is_null(a)) {
+      if (a.index >= space->capacity) break;
+      if (space->flags[a.index] & dirty_mask) { redundant = true; break; }
+      a = space->parents[a.index];
+    }
+    if (!redundant) {
+      space->dirty_roots[write++] = n;
+    }
+  }
+  space->dirty_count = write;
+}
 
 SPATIAL_EXPORT
 void
@@ -986,6 +1029,12 @@ spatial_update(spatial_space_t * __restrict space) {
 
   if (!space) return;
 
+  if (space->dirty_count == 0) {
+    space->update_version++;
+    return;
+  }
+
+  spatial__compact_dirty(space);
   if (space->dirty_count == 0) {
     space->update_version++;
     return;
@@ -1072,20 +1121,33 @@ spatial__alloc_slot2(spatial_space2_t *space) {
 
 static
 void
-spatial__push_dirty2(spatial_space2_t *space, spatial_node_t handle) {
-  spatial_node_t a;
+spatial__push_dirty2(spatial_space2_t *space,
+                     spatial_node_t    handle,
+                     uint32_t          dirty_flag) {
   const uint32_t dirty_mask = SPATIAL_NODE_DIRTY_LOCAL | SPATIAL_NODE_DIRTY_WORLD;
+  uint32_t       idx = handle.index;
+  spatial_node_t a;
 
-  a = space->parents[handle.index];
+  if (space->flags[idx] & dirty_mask) {
+    space->flags[idx] |= dirty_flag;
+    return;
+  }
+
+  a = space->parents[idx];
   while (!spatial_node_is_null(a)) {
     if (a.index >= space->capacity) break;
-    if (space->flags[a.index] & dirty_mask) return;
+    if (space->flags[a.index] & dirty_mask) {
+      space->flags[idx] |= dirty_flag;
+      return;
+    }
     a = space->parents[a.index];
   }
 
+  space->flags[idx] |= dirty_flag;
   if (SPATIAL_UNLIKELY(space->dirty_count >= space->dirty_capacity)) {
     uint32_t nc = space->dirty_capacity * 2;
     space->dirty_roots    = realloc(space->dirty_roots, sizeof(spatial_node_t) * nc);
+    SPATIAL_OOM_CHECK(space->dirty_roots);
     space->dirty_capacity = nc;
   }
   space->dirty_roots[space->dirty_count++] = handle;
@@ -1202,7 +1264,7 @@ spatial_node2_create(spatial_space2_t       *space,
   space->world_rotations[slot]    = (spatial_rot2_t){ .c = 1.0f, .s = 0.0f };
   space->world_scales[slot][0]    = 1; space->world_scales[slot][1]    = 1;
   glm_mat3_identity(space->world_matrices[slot]);
-  space->flags[slot]    = SPATIAL_NODE_ALIVE | SPATIAL_NODE_DIRTY_LOCAL;
+  space->flags[slot]    = SPATIAL_NODE_ALIVE;
   space->versions[slot] = 1;
   space->users[slot]    = NULL;
 
@@ -1211,7 +1273,7 @@ spatial_node2_create(spatial_space2_t       *space,
   handle = (spatial_node_t){ .index = slot, .generation = space->generations[slot] };
   space->first_children[parent.index] = handle;
 
-  spatial__push_dirty2(space, handle);
+  spatial__push_dirty2(space, handle, SPATIAL_NODE_DIRTY_LOCAL);
   return handle;
 }
 
@@ -1293,8 +1355,7 @@ spatial_node2_attach(spatial_space2_t *space,
   space->next_siblings[child.index]       = space->first_children[new_parent.index];
   space->first_children[new_parent.index] = child;
 
-  space->flags[child.index] |= SPATIAL_NODE_DIRTY_LOCAL;
-  spatial__push_dirty2(space, child);
+  spatial__push_dirty2(space, child, SPATIAL_NODE_DIRTY_LOCAL);
   return true;
 }
 
@@ -1309,8 +1370,7 @@ spatial_node2_set_local(spatial_space2_t       *space,
   space->local_rotations[handle.index]    = local->rotation;
   space->local_scales[handle.index][0]    = local->scale[0];
   space->local_scales[handle.index][1]    = local->scale[1];
-  space->flags[handle.index] |= SPATIAL_NODE_DIRTY_LOCAL;
-  spatial__push_dirty2(space, handle);
+  spatial__push_dirty2(space, handle, SPATIAL_NODE_DIRTY_LOCAL);
 }
 
 SPATIAL_EXPORT
@@ -1338,8 +1398,8 @@ spatial_node2_set_world_physics(spatial_space2_t       *space,
   space->world_rotations[handle.index]    = world->rotation;
   space->world_scales[handle.index][0]    = world->scale[0];
   space->world_scales[handle.index][1]    = world->scale[1];
-  space->flags[handle.index] |= SPATIAL_NODE_DIRTY_WORLD | SPATIAL_NODE_PHYSICS_OWNS;
-  spatial__push_dirty2(space, handle);
+  space->flags[handle.index] |= SPATIAL_NODE_PHYSICS_OWNS;
+  spatial__push_dirty2(space, handle, SPATIAL_NODE_DIRTY_WORLD);
 }
 
 SPATIAL_EXPORT
