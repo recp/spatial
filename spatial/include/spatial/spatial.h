@@ -145,6 +145,54 @@ SPATIAL_EXPORT void spatial_node_set_matrix(spatial_space_t *space,
 SPATIAL_EXPORT void spatial_node_clear_matrix(spatial_space_t *space,
                                               spatial_node_t   handle);
 
+/* ================================================================== */
+/* Zero-copy live accessors.                                          */
+/*                                                                    */
+/* These return pointers into the space's SoA arrays. No memcpy, no   */
+/* function-call overhead (all inline). Pointers remain valid until:  */
+/*   - spatial_node_create grows the arrays (use spatial_space_reserve */
+/*     to pin them upfront), or                                       */
+/*   - spatial_space_destroy is called.                                */
+/*                                                                    */
+/* No validation. Caller must ensure the handle is live. For physics  */
+/* / graphics hot loops these are the recommended read path.          */
+/* ================================================================== */
+
+SPATIAL_INLINE const mat4 *
+spatial_node_world_matrix(const spatial_space_t *s, spatial_node_t h) {
+  return &s->world_matrices[h.index];
+}
+
+SPATIAL_INLINE const vec4 *
+spatial_node_world_position(const spatial_space_t *s, spatial_node_t h) {
+  return &s->world_positions[h.index];
+}
+
+SPATIAL_INLINE const versor *
+spatial_node_world_rotation(const spatial_space_t *s, spatial_node_t h) {
+  return &s->world_rotations[h.index];
+}
+
+SPATIAL_INLINE const vec4 *
+spatial_node_world_scale(const spatial_space_t *s, spatial_node_t h) {
+  return &s->world_scales[h.index];
+}
+
+SPATIAL_INLINE const vec4 *
+spatial_node_local_position(const spatial_space_t *s, spatial_node_t h) {
+  return &s->local_positions[h.index];
+}
+
+SPATIAL_INLINE const versor *
+spatial_node_local_rotation(const spatial_space_t *s, spatial_node_t h) {
+  return &s->local_rotations[h.index];
+}
+
+SPATIAL_INLINE const vec4 *
+spatial_node_local_scale(const spatial_space_t *s, spatial_node_t h) {
+  return &s->local_scales[h.index];
+}
+
 /* Update */
 SPATIAL_EXPORT void spatial_update(spatial_space_t *space);
 

@@ -310,6 +310,38 @@ TEST(parallel_update) {
   spatial_space_destroy(s);
 }
 
+TEST(zero_copy_accessors) {
+  spatial_space_t *s = spatial_space_create(8);
+  spatial_pose_t   p = SPATIAL_POSE_IDENTITY;
+  spatial_node_t   a;
+  const mat4      *mp;
+  const vec4      *pp;
+  const versor    *qp;
+
+  p.position[0] = 7.0f;
+  p.position[1] = 8.0f;
+  p.position[2] = 9.0f;
+  a = spatial_node_create(s, SPATIAL_NODE_NULL, &p);
+  spatial_update(s);
+
+  mp = spatial_node_world_matrix(s, a);
+  pp = spatial_node_world_position(s, a);
+  qp = spatial_node_world_rotation(s, a);
+
+  /* Pointers must alias the SoA arrays (no copy). */
+  CHECK(mp == (const mat4 *)&s->world_matrices[a.index]);
+  CHECK(pp == (const vec4 *)&s->world_positions[a.index]);
+  CHECK(qp == (const versor *)&s->world_rotations[a.index]);
+
+  /* Values readable via pointer. */
+  CHECK_FLOAT((*pp)[0], 7.0f);
+  CHECK_FLOAT((*pp)[1], 8.0f);
+  CHECK_FLOAT((*pp)[2], 9.0f);
+  CHECK_FLOAT((*mp)[3][0], 7.0f);
+
+  spatial_space_destroy(s);
+}
+
 TEST(soa_direct_access) {
   /* Data-oriented hot path: physics writes directly to SoA arrays. */
   spatial_space_t *s = spatial_space_create(8);
@@ -399,6 +431,7 @@ int main(void) {
   RUN(update_version_bumps);
   RUN(node_version_bumps_on_change);
   RUN(dirty_dedupe);
+  RUN(zero_copy_accessors);
   RUN(soa_direct_access);
   RUN(reserve_keeps_pointers_stable);
   RUN(parallel_update);
