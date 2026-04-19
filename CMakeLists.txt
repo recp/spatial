@@ -46,7 +46,9 @@ target_include_directories(spatial
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/spatial/include>
     $<INSTALL_INTERFACE:include>)
 
-target_include_directories(spatial PUBLIC ${CGLM_INCLUDE_DIR})
+target_include_directories(spatial PUBLIC
+  $<BUILD_INTERFACE:${CGLM_INCLUDE_DIR}>
+  $<INSTALL_INTERFACE:include>)
 if(TARGET cglm::cglm)
   target_link_libraries(spatial PUBLIC cglm::cglm)
 endif()
