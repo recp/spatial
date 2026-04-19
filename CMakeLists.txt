@@ -46,6 +46,12 @@ target_include_directories(spatial
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/spatial/include>
     $<INSTALL_INTERFACE:include>)
 
+if(BUILD_SHARED_LIBS)
+  target_compile_definitions(spatial PRIVATE SPATIAL_EXPORTS)
+else()
+  target_compile_definitions(spatial PUBLIC SPATIAL_STATIC)
+endif()
+
 target_include_directories(spatial PUBLIC
   $<BUILD_INTERFACE:${CGLM_INCLUDE_DIR}>
   $<INSTALL_INTERFACE:include>)
