@@ -1,4 +1,4 @@
-#  🔭 spatial
+#  🔭 spatial - WIP / Experimental
 
 **spatial** is a shared spatial kernel for engines.
 
@@ -112,7 +112,7 @@ for (uint32_t i = 0; i < draw_count; i++) {
 }
 ```
 
-Measured on an M1 Pro: `3.5 ns / node` for the pointer accessor — same
+Measured on an M1 Max: `3.5 ns / node` for the pointer accessor — same
 as hand-written `&space->world_matrices[h.index]`. The safe copy variant
 (`spatial_node_get_world_matrix`) runs at `12.6 ns` due to the 64-byte
 memcpy and handle validation.
@@ -172,6 +172,26 @@ MT path.
 ## Dependencies
 
 - [cglm](https://github.com/recp/cglm)
+
+## Ecosystem
+
+`spatial` is designed to be the shared spatial substrate for this set
+of projects. Each one plugs into it through the roles described above:
+
+| project                                              | role                    | how it uses spatial                          |
+|------------------------------------------------------|-------------------------|----------------------------------------------|
+| [cglm](https://github.com/recp/cglm)                 | math                    | dependency — vectors, quats, matrices        |
+| [AssetKit](https://github.com/recp/AssetKit)         | asset I/O (glTF/COLLADA)| imports node trees into `spatial_space_t`    |
+| [anim](https://github.com/recp/anim)                 | animation               | writes bone `local` poses                    |
+| [phy](https://github.com/recp/phy)                   | physics                 | writes rigid-body `world` poses (`PHYSICS_OWNS`) |
+| [gpu](https://github.com/recp/gpu)                   | pure GPU abstraction    | underlying layer for the render engine       |
+| [rend](https://github.com/recp/rend)                 | render engine           | reads `world_matrix` for draw submissions    |
+| [rays](https://github.com/recp/rays)                 | ray tracing             | reads `world_matrix` for acceleration structures |
+| [reality](https://github.com/recp/reality)           | AR                      | reads camera / anchor poses                  |
+| [UniversalShading](https://github.com/UniversalShading) | shading language     | consumes world transforms via `rend` shader bindings |
+
+Integrations are in progress; API changes in `spatial` are expected
+as real use exposes rough edges.
 
 ## Status
 
