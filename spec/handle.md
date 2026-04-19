@@ -71,14 +71,19 @@ synchronization for all mutating calls. A higher-tier implementation
 
 ## Why handles and not pointers
 
-- Storage can grow without invalidating references.
-- Safe to share across systems (physics, graphics, audio, networking)
-  without ownership coupling.
-- Detectable use-after-free via generation mismatch.
-- Matches the modern consensus (Jolt `BodyID`, Rapier
-  `RigidBodyHandle`, Box2D v3 `b2BodyId`).
+- Storage can grow without invalidating references — a scene can add a
+  thousand objects mid-frame without breaking cached identifiers held
+  by the render queue, the physics set, or the animation state.
+- Safe to share across systems (graphics, physics, audio, networking,
+  scripting) without ownership coupling.
+- Detectable use-after-free via generation mismatch — after
+  `spatial_node_destroy`, a stale handle fails validation instead of
+  reading recycled memory.
 
 Pointer-based parent/child/sibling links inside node data are **not
 exposed** to callers. Internally an implementation **MAY** use
 pointers if the node array is not reallocated, but the public API
-**MUST** use `spatial_node_t`.
+**MUST** use `spatial_node_t`. This is the same pattern modern physics
+engines already converged on (Jolt `BodyID`, Rapier
+`RigidBodyHandle`, Box2D v3 `b2BodyId`), which makes cross-system
+interop easier.

@@ -16,11 +16,12 @@ Phase 5  Render             — multiple reader threads, READ-ONLY
 
 Two parallel surfaces:
 
-1. **Writers in Phase 2** — physics / animation jobs that set poses on
-   disjoint node ranges. Use `spatial_node_mark_dirty_mt`.
-2. **Readers in Phase 5** — render, culling, command recording.
-   Lock-free by construction; no API needed beyond the zero-copy
-   accessors.
+1. **Readers in Phase 5** — render, culling, command recording, GPU
+   command buffer workers. Lock-free by construction; no API needed
+   beyond the zero-copy accessors. This is the common case and
+   works automatically.
+2. **Writers in Phase 2** — physics / animation jobs that set poses on
+   disjoint node ranges. Opt in with `spatial_node_mark_dirty_mt`.
 
 `spatial_update` in Phase 4 is itself either sequential or parallel,
 orthogonal to the above.
@@ -132,7 +133,12 @@ Setting non-dirty flags (`PHYSICS_OWNS`, `HAS_MATRIX`) from multiple
 threads is **safe** only if the threads OR'ing them agree — or if each
 thread OR'ing a given node is the sole owner of that node.
 
-## Read side
+## Read side (Phase 5)
+
+The lock-free read surface is what most multi-threaded engines
+actually need. Render, culling, GPU command recording, and SSBO
+upload workers can all run in parallel reading the same spatial
+arrays.
 
 Readers during Phase 5 do not need any special API. Every zero-copy
 accessor is `const`-returning and plain memory access — no locks, no
@@ -146,6 +152,7 @@ vkCmdPushConstants(cmd, layout, stage, 0, sizeof(mat4), m);
 
 `spatial_update` must have completed before readers start. Once it
 returns, mutex-release barriers make all writes visible to all threads.
+No further synchronization is needed between readers themselves.
 
 ## Unsupported
 

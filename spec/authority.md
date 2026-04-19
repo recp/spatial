@@ -49,40 +49,72 @@ implementation documents lock-free reads.
 
 ## Conventional authority
 
-| content type           | authoritative system | flag combo                           |
-|------------------------|----------------------|--------------------------------------|
-| static world geometry  | editor               | `STATIC`                             |
-| animated objects       | animation system     | (none; writes local)                 |
-| dynamic rigid bodies   | physics engine       | `PHYSICS_OWNS`                       |
-| kinematic bodies       | game code            | `PHYSICS_OWNS | KINEMATIC`           |
-| camera / audio listener| game / animation     | (none; reads world)                  |
+| content type           | authoritative system | flag combo                 |
+|------------------------|----------------------|----------------------------|
+| static world geometry  | editor               | `STATIC`                   |
+| skeletal bones         | animation system     | (none; writes `local`)     |
+| dynamic rigid bodies   | physics engine       | `PHYSICS_OWNS`             |
+| kinematic bodies       | game code            | `PHYSICS_OWNS | KINEMATIC` |
+| camera rig, cutscene   | game / animation     | (none; writes `local`)     |
+| audio listener / emitter | game / animation   | (none; reads `world`)      |
+| AR anchor / tracked camera | AR runtime       | (none; writes `local`)     |
 
-## Physics integration
+## Per-system integration
 
-When `SPATIAL_NODE_PHYSICS_OWNS` is set:
+Each system below reads or writes through the same spatial contract.
+These are concise notes; full patterns live in [hotpath.md](hotpath.md)
+and [parallel.md](parallel.md).
 
-1. Physics engine steps the simulation.
+### Graphics
+
+Reads `world_matrix` after `spatial_update()` completes. Multiple
+render / command-recording threads may read concurrently — all reads
+are lock-free. Graphics **MUST NOT** write `world` except on nodes it
+owns (e.g. a root camera rig). Culling, skinning, and draw submission
+share the same read pattern.
+
+### Animation
+
+Writes bone `local` poses every frame and sets `DIRTY_LOCAL`. Runs
+before physics in a typical frame so physics can read the resolved
+animated pose as its input. Multi-threaded job systems write
+disjoint bone ranges via `spatial_node_mark_dirty_mt`.
+
+### Physics
+
+When `SPATIAL_NODE_PHYSICS_OWNS` is set on a node:
+
+1. Physics steps the simulation.
 2. For each active body, physics writes `world.position` and
    `world.rotation` into the node.
-3. Physics sets `SPATIAL_NODE_DIRTY_WORLD`.
+3. Physics sets `SPATIAL_NODE_DIRTY_WORLD` (or uses
+   `spatial_node_mark_dirty_mt` for parallel solvers).
 4. Caller invokes `spatial_update(space)`.
-5. `spatial_update()` propagates the new world to children and
-   refreshes `world_matrix`.
 
-Physics **SHOULD NOT** read or write the expression chain on
-physics-owned nodes. Physics **SHOULD** treat `local` as derived
-when it owns the node.
+Physics **SHOULD NOT** touch the expression chain on physics-owned
+nodes. Physics **SHOULD** treat `local` as derived when it owns the
+node.
 
-## Graphics integration
+### Audio
 
-Graphics **MUST NOT** write to `world` unless it holds authority
-(e.g. root camera rig). Graphics reads `world_matrix` after
-`spatial_update()` has completed for the frame.
+Reads `world.position` and, for directional emitters,
+`world.rotation`. Audio **MUST NOT** write spatial state. One read
+pass per audio frame is typical; spatial is cheap to poll.
 
-## Audio integration
+### AR / reality
 
-Audio reads `world.position` and optionally `world.rotation` (for
-directional emitters). Audio **MUST NOT** write spatial state.
+The AR runtime writes the **tracked camera** and **anchor** `local`
+poses each frame from sensor fusion, setting `DIRTY_LOCAL`.
+Everything anchored to an AR anchor cascades via the usual parent /
+child composition — no AR-specific API is required. Rendering the
+AR scene is just the graphics read path.
+
+### Editor / tools
+
+Authors `local` pose on any node that is not physics-owned, sets
+`DIRTY_LOCAL`. Editors may also use the optional transform-expression
+layer (look-at, skew, matrix stack) that evaluates into canonical
+`local` pose.
 
 ## Ownership transfer
 

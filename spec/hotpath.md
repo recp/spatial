@@ -1,197 +1,134 @@
 # hot-path access
 
-Physics solvers iterate bodies thousands of times per simulation step.
-Per-iteration handle validation and slot indexing adds unnecessary
-overhead. This document describes the recommended pattern for caching
-direct pointers into spatial node storage during hot loops.
+Render loops, culling jobs, and physics solvers read and write
+transforms tens of thousands of times per frame. This document
+describes zero-copy access patterns that keep spatial out of the
+critical path.
 
-## The slow path
+## Zero-copy reads — render, culling, command recording
 
-```c
-for (int iter = 0; iter < N; iter++) {
-  spatial_node_data_t *n = spatial_node_get(space, body->node);
-  if (!n) continue;
-  /* read / write n->world */
-}
-```
-
-Each iteration does:
-- handle validity check (2 comparisons + array read)
-- array index (pointer arithmetic)
-- null-check on the returned pointer
-
-For 10k bodies × 20 solver iterations × 60 Hz, that is 12M redundant
-validations per second. Avoidable.
-
-## The fast path
+The inline pointer accessors return `const`-qualified pointers
+directly into the SoA arrays. No memcpy, no function-call overhead
+after inlining. Pass the pointer straight to graphics / GPU APIs.
 
 ```c
-/* once, before the solver loop */
-spatial_node_data_t *body_data[N];
-for (int i = 0; i < N; i++) {
-  body_data[i] = spatial_node_get(space, bodies[i].node);  /* may be NULL */
-}
-
-/* hot loop */
-for (int iter = 0; iter < N; iter++) {
-  spatial_node_data_t *n = body_data[iter];
-  if (!n) continue;
-  /* direct access */
-  n->world.position[0] += velocity[iter][0] * dt;
-}
-```
-
-Handle validation happens once per body per frame, not per solver
-iteration.
-
-## Correctness requirements
-
-A cached `spatial_node_data_t *` is valid only while:
-
-1. **No node is destroyed** in the space. `spatial_node_destroy()`
-   marks the slot free and bumps its generation. The pointer still
-   points to valid memory, but the slot may be reused.
-2. **No node is created beyond capacity**. `spatial_node_create()`
-   may `realloc()` the underlying array, invalidating all cached
-   pointers.
-3. **The space is not destroyed.**
-
-If any of the above may occur during the hot loop, either refresh the
-cache or pre-reserve capacity.
-
-## Pre-reserving capacity
-
-To guarantee no `realloc` during the simulation step, create the space
-with sufficient capacity upfront:
-
-```c
-spatial_space_t *space = spatial_space_create(expected_max_nodes);
-```
-
-The space grows by doubling; starting at a known upper bound avoids
-mid-frame reallocation.
-
-A future `spatial_space_reserve(space, cap)` function would make this
-explicit; for now, pass the target capacity at creation time.
-
-## Matching the solver frame boundary
-
-A safe pattern is to refresh pointer caches at the start of each
-simulation step, after any structural changes (creates / destroys)
-from game code have been applied:
-
-```c
-frame_begin(space);          /* game code creates / destroys nodes */
-spatial_update(space);       /* propagate from game logic */
-
-refresh_body_pointer_cache(); /* cache fresh pointers */
-
-for (substep = 0; substep < N; substep++) {
-  physics_integrate(body_data);   /* fast path */
-  physics_solve_constraints();    /* fast path */
-}
-
-/* write back dirty flags so spatial_update will propagate children */
-for (i = 0; i < count; i++) {
-  body_data[i]->flags |= SPATIAL_NODE_DIRTY_WORLD | SPATIAL_NODE_PHYSICS_OWNS;
-}
-spatial_update(space);
-```
-
-## Direct dirty-flag writes
-
-Inside the hot loop, setting `SPATIAL_NODE_DIRTY_WORLD` directly on
-the cached pointer is safe. The flag will be picked up by the next
-`spatial_update()`. Bypassing `spatial_node_set_world_physics()`
-avoids a handle lookup and a second dirty-list push per write.
-
-If the node is not already in `space->dirty_roots`, push it once at
-the end of the substep loop via the public API, or append the handle
-directly (implementation-dependent).
-
-## Sibling / child traversal in hot paths
-
-Traversing children via cached pointers is also fine, but each hop
-costs a lookup because `n->first_child` is a `spatial_node_t` handle,
-not a pointer. If a physics engine needs a flat list of bodies under a
-subtree, precompute that list once per frame rather than walking the
-hierarchy on every iteration.
-
-## What not to do
-
-- Do not cache pointers across `spatial_node_create()` calls unless
-  capacity is reserved.
-- Do not cache pointers across `spatial_node_destroy()` calls. The
-  memory is still valid, but the slot may have been recycled into an
-  unrelated node with a new generation.
-- Do not share cached pointers across threads without external
-  synchronization (spatial is not thread-safe by default).
-- Do not skip the initial validation. A `NULL` from `spatial_node_get`
-  must be respected on first cache; after that, cached pointers can be
-  trusted for the scope defined above.
-
-## Summary
-
-Validate once per frame, access directly thereafter. Reserve capacity
-to prevent `realloc`. Never cache across node destroys. This pattern
-lets spatial underlie a physics solver with effectively zero overhead
-versus a dedicated physics transform store.
-
-For multi-threaded writers (physics / animation job systems), see
-[parallel.md](parallel.md) and `spatial_node_mark_dirty_mt` —
-lock-free per-node dirty push backed by atomic fetch-or / fetch-add.
-
-## Zero-copy reads for graphics
-
-For render loops, command recording, and culling jobs, use the
-inline pointer accessors. They return `const`-qualified pointers
-directly into the SoA arrays — no memcpy, no function-call overhead
-after inlining.
-
-```c
-/* Vulkan command recording, no copies. */
+/* Vulkan command recording, no intermediate buffer. */
 for (uint32_t i = first; i < last; i++) {
     const mat4 *m = spatial_node_world_matrix(space, handles[i]);
-    vkCmdPushConstants(cmd, layout, stage, 0, sizeof(mat4), m);
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT,
+                       0, sizeof(mat4), m);
+    vkCmdDrawIndexed(cmd, draws[i].index_count, 1, 0, 0, 0);
 }
 ```
 
 ```c
-/* Culling — read position + bounds, no copies. */
+/* Culling — read position + radius, no copies. */
 const vec4 *pos = spatial_node_world_position(space, handle);
 float dist2 = (*pos)[0]*(*pos)[0] + (*pos)[1]*(*pos)[1] + (*pos)[2]*(*pos)[2];
+if (dist2 > cull_radius * cull_radius) skip(handle);
 ```
 
-Available zero-copy accessors:
+### Accessor cheat sheet
 
-| function                               | returns              |
-|----------------------------------------|----------------------|
-| `spatial_node_world_matrix(s, h)`      | `const mat4 *`       |
-| `spatial_node_world_position(s, h)`    | `const vec4 *`       |
-| `spatial_node_world_rotation(s, h)`    | `const versor *`     |
-| `spatial_node_world_scale(s, h)`       | `const vec4 *`       |
-| `spatial_node_local_position(s, h)`    | `const vec4 *`       |
-| `spatial_node_local_rotation(s, h)`    | `const versor *`     |
-| `spatial_node_local_scale(s, h)`       | `const vec4 *`       |
+| function                              | returns              | use                               |
+|---------------------------------------|----------------------|-----------------------------------|
+| `spatial_node_world_matrix(s, h)`     | `const mat4 *`       | vertex transforms, skin bind     |
+| `spatial_node_world_position(s, h)`   | `const vec4 *`       | culling, AABB center, audio       |
+| `spatial_node_world_rotation(s, h)`   | `const versor *`     | directional audio, oriented tests |
+| `spatial_node_world_scale(s, h)`      | `const vec4 *`       | bounding volume scaling           |
+| `spatial_node_local_*`                | same                 | animation read-back, editors      |
 
-Pointers remain valid until the next `spatial_node_create` that
-grows the arrays, or until `spatial_space_destroy`. Call
+Pointers remain valid until the next `spatial_node_create` that grows
+the arrays, or until `spatial_space_destroy`. Call
 `spatial_space_reserve` upfront to pin pointers for the lifetime of
 the space.
 
-These accessors perform **no handle validation** — caller must
-ensure the handle is live. For cold paths or untrusted handles, use
-the copy variants (`spatial_node_get_world_matrix`, etc.) which
-validate and return `false` on bogus handles.
+These accessors perform **no handle validation** — caller must ensure
+the handle is live. For cold paths or untrusted handles, use the copy
+variants (`spatial_node_get_world_matrix`, …) which validate and
+return `false` on bogus handles.
 
-For **writes** in physics hot loops, write directly to the SoA arrays:
+## Pre-reserving capacity
+
+Growth is the only thing that can move SoA storage. Call
+`spatial_space_reserve` to a known upper bound before the frame
+loop and cached pointers stay valid for the lifetime of the space:
 
 ```c
-space->world_positions[idx][0] = x;
-space->world_positions[idx][1] = y;
-space->world_positions[idx][2] = z;
-space->flags[idx] |= SPATIAL_NODE_DIRTY_WORLD | SPATIAL_NODE_PHYSICS_OWNS;
+spatial_space_t *space = spatial_space_create(1024);
+spatial_space_reserve(space, MAX_SCENE_NODES);  /* pin */
+/* build scene, cache handles and pointers, render … */
 ```
 
-The safe copy setters (`spatial_node_set_world_physics`) are
-provided for cold-path use.
+A future `spatial_space_set_growable(space, false)` could make growth
+an assert if that ever becomes desirable; the current implementation
+trusts the caller.
+
+## Zero-copy writes — physics, animation, direct authority
+
+Write paths skip the safe setters by mutating SoA slots directly and
+setting the dirty flag. One cache line touched per write.
+
+```c
+/* Physics solver hot loop. */
+for (uint32_t i = 0; i < body_count; i++) {
+    uint32_t idx = bodies[i].handle.index;
+    space->world_positions[idx][0] = bodies[i].x;
+    space->world_positions[idx][1] = bodies[i].y;
+    space->world_positions[idx][2] = bodies[i].z;
+    glm_quat_copy(bodies[i].q, space->world_rotations[idx]);
+    space->flags[idx] |= SPATIAL_NODE_DIRTY_WORLD | SPATIAL_NODE_PHYSICS_OWNS;
+}
+/* ... one spatial_update at end of frame propagates to descendants. */
+```
+
+```c
+/* Animation bone writer. */
+for (uint32_t i = 0; i < bone_count; i++) {
+    uint32_t idx = bones[i].handle.index;
+    glm_vec3_copy(bones[i].pos, space->local_positions[idx]);
+    space->local_positions[idx][3] = 0.0f;
+    glm_quat_copy(bones[i].rot, space->local_rotations[idx]);
+    glm_vec3_copy(bones[i].scl, space->local_scales[idx]);
+    space->local_scales[idx][3] = 0.0f;
+    space->flags[idx] |= SPATIAL_NODE_DIRTY_LOCAL;
+}
+```
+
+For each animation and physics frame, the caller also appends the
+mutated handles to `space->dirty_roots` or calls
+`spatial_node_mark_dirty_mt` (multi-threaded, see [parallel.md](parallel.md)).
+
+## Correctness rules
+
+Direct SoA access is unsafe across structural changes. The contract:
+
+1. **Do not cache pointers across `spatial_node_create` calls unless
+   capacity is reserved.** Growth reallocates; cached pointers are
+   dangling.
+2. **Do not cache pointers across `spatial_node_destroy`.** The memory
+   is still valid but the slot may have been recycled into a different
+   node with a new generation.
+3. **Do not share cached pointers across threads without external
+   synchronization.** spatial is not lock-free on mutating calls
+   unless documented otherwise; see [parallel.md](parallel.md).
+
+## Thread safety summary
+
+| phase / path                                    | safety                                  |
+|-------------------------------------------------|-----------------------------------------|
+| Multiple threads **read** world poses / matrices | lock-free, always safe                  |
+| Multiple threads **write** disjoint nodes        | safe; use `spatial_node_mark_dirty_mt`  |
+| Multiple threads **write** same node             | unsafe; engine must serialize ownership |
+| Concurrent **read** and **write** of same node   | unsafe; separate with phase barriers    |
+
+## Summary
+
+Read once per frame via handle — from then on, access SoA arrays
+directly. Reserve upfront to pin pointers. For writes, skip the safe
+setters on the hot path; set the flag and let `spatial_update` do the
+propagation.
+
+For multi-threaded writers (physics / animation job systems), see
+[parallel.md](parallel.md) — `spatial_node_mark_dirty_mt` is the
+lock-free per-node dirty push backed by atomic fetch-or / fetch-add.
